@@ -610,7 +610,7 @@ class PointSourceSolver(EikonalSolver):
         # Make sure to filter out any NaN values.
         tt = self.near_field.tt.resample(nodes[idxs].reshape(-1, 3))
         idxs = np.swapaxes(np.stack(idxs), 0, 1)[~np.isnan(tt)]
-        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)]
+        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)] #### hmmm
 
 
     def interpolate_far_field_velocity_onto_near_field(self) -> bool:

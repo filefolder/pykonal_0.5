@@ -1,36 +1,20 @@
-![](https://img.shields.io/github/issues/malcolmw/pykonal)
-![](https://img.shields.io/github/forks/malcolmw/pykonal)
-![](https://img.shields.io/github/stars/malcolmw/pykonal)
-![](https://img.shields.io/github/license/malcolmw/pykonal)
 # Welcome to the *pykonal* repository!
 
-This code implements the Fast Marching Method (FMM; Sethian *et al.*, 1996) for solving the eikonal equation in Cartesian or spherical coordinates in 2 or 3 dimensions. The method implements mixed first- and second-order finite differences.
+# >>> This is a forked "0.5" version required to run PyKonal on modern systems and is necessary for PyVoroTomo version 2 <<<
 
-![Raypaths](figures/pykonal_rays.png)
+There are a few critical as well as smaller improvements.
 
-PyKonal offers two features that are absent from the comparable [scikit-fmm](https://pythonhosted.org/scikit-fmm/ "sckit-fmm documentation") package: (a) an implementation in spherical coordinates, and (b) functionality to compute shortest-traveltime paths.
+See the original for details on how the code works: https://github.com/malcolmw/pykonal
 
-## Documentation
-Documentation is available [here](https://malcolmw.github.io/pykonal-docs/ "PyKonal documentation").
+## Installation
     
+To install this version specifically, either download the package, unzip and install, or via pip:
+
+$ pip install git+https://github.com/filefolder/pykonal_0.5.git
+
 ## Citation
 If you make use of this code in published work, please cite White *et al.* (2020).
 
-## Installation
-
-### PIP—recommended
-```bash
-sh$> pip install pykonal
-```
-
-### From source code
-Download and unzip the [latest release](https://github.com/malcolmw/pykonal/releases "Releases").
-```bash
-sh$> cd path/to/pykonal
-sh$> pip install .
-```
-## Bugs
-Please report bugs, feature requests, and questions through the [Issues](https://github.com/malcolmw/pykonal/issues "PyKonal Issues tracker") tracker.
 
 ## References
 1. Sethian, J. A. (1996). A fast marching level set method for monotonically advancing fronts. *Proceedings of the National Academy of Sciences, 93*(4), 1591–1595. https://doi.org/10.1073/pnas.93.4.1591

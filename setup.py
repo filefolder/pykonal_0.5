@@ -15,12 +15,12 @@ description     = "Solve the Eikonal equation in 3D Cartesian or spherical coord
 url             = "https://github.com/malcolmw/pykonal"
 email           = "malcolmw@mit.edu"
 author          = "Malcolm C. A. White"
-requires_python = ">=3"
+requires_python = ">=3.8"
 packages        = ["pykonal"]
 package_data    = {
     "pykonal": ["data/*", "data/marmousi2/*", "tests/data/*"],
 }
-required        = ["cython>=0.29.14", "h5py", "numpy", "scipy"]
+required        = ["cython>=3.2.3", "h5py", "numpy", "scipy"]
 extras          = {"tests": ["nose"]}
 ext_modules     = cythonize(
     [
@@ -83,7 +83,7 @@ setup(
         "Operating System :: POSIX :: Linux",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: Implementation :: CPython",
         "Topic :: Scientific/Engineering :: Physics"
     ]

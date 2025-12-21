@@ -432,7 +432,7 @@ cdef class ScalarField3D(Field3D):
 
         for idx in range(3):
             ray.push_back(end[idx])
-        value = np.infty
+        value = np.inf ### RCP have to change np.infty to np.inf for numpy 2.0
 
         while True:
             point = <constants.REAL_t[:3]>&ray[ray.size()-3]
@@ -506,6 +506,10 @@ cdef class ScalarField3D(Field3D):
             else:
                 ii[iax][0]  = <Py_ssize_t>idx[iax]
                 ii[iax][1]  = <Py_ssize_t>(ii[iax][0]+1) % self.npts[iax]
+                # **** double check still in bounds (RCP)
+                if ii[iax][0] < 0 or ii[iax][0] >= self.npts[iax] or ii[iax][1] < 0 or ii[iax][1] >= self.npts[iax]:
+                    return null
+
             delta[iax] = idx[iax] % 1
         f000    = self.cy_values[ii[0][0], ii[1][0], ii[2][0]]
         f100    = self.cy_values[ii[0][1], ii[1][0], ii[2][0]]
