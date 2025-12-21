@@ -16,12 +16,12 @@ from . import transformations as _transformations
 
 cimport numpy as np
 
-from libc.math cimport sqrt
+from libc.math cimport sqrt, isinf, isnan
 
 from . cimport fields
 from . cimport constants
 
-inf = np.inf
+#inf = np.inf
 
 cdef class EQLocator(object):
     """
@@ -201,12 +201,13 @@ cdef class EQLocator(object):
         cdef dict traveltimes = self.cy_traveltimes
         cdef constants.REAL_t csum = 0
         cdef constants.REAL_t num
+        cdef constants.REAL_t tt
         cdef constants.REAL_t t0 = hypocenter[3]
         cdef int valid_measurements = 0
 
         for key in arrivals:
-            tt = traveltimes[key].value(hypocenter[:3], null=np.inf)
-            if np.isinf(tt) or np.isnan(tt) or tt>99: # RCP added isnan check also (huge issue!!!)
+            tt = traveltimes[key].value(hypocenter[:3], null=1e6)
+            if isinf(tt) or isnan(tt) or tt>1e5: # RCP added isnan check also
                 continue  # Skip invalid measurements
             num = arrivals[key] - t0 - tt
             csum += num * num
@@ -216,32 +217,6 @@ cdef class EQLocator(object):
             return 1e6 # np.inf  # Tell optimizer this is a bad point (RCP using "large number" instead of infinity?)
             
         return (sqrt(csum/valid_measurements))
-    """
-    ## RCP now weighing solution by arrival residuals.. not smart but here's how we might plug in a distance weight
-    cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):
-           cdef tuple key
-           cdef dict arrivals
-           cdef dict traveltimes 
-           cdef constants.REAL_t csum = 0
-           cdef constants.REAL_t wsum = 0
-           cdef constants.REAL_t num, weight, tt
-           cdef constants.REAL_t t0
-
-           arrivals = self.cy_arrivals
-           traveltimes = self.cy_traveltimes
-           t0 = hypocenter[3]
-
-           for key in arrivals:
-               tt = traveltimes[key].value(hypocenter[:3], null=np.inf)
-               if np.isinf(tt):
-                   continue
-               num = arrivals[key] - t0 - tt
-               weight = 1.0 / (1.0 + abs(num))
-               csum += weight * num * num
-               wsum += weight
-
-           return (sqrt(csum/wsum)) if wsum > 0 else np.inf
-    """
 
 
     cpdef np.ndarray[constants.REAL_t, ndim=1] locate(
@@ -264,9 +239,10 @@ cdef class EQLocator(object):
             max_coords=max_coords[:3]
         )
 
-        # RCP added the kwargs.. who knows
+        # RCP added some kwargs
         soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin', updating='immediate', 
-                                                     maxiter=200,mutation=(0.2,0.6), recombination=0.5, popsize=35, atol=0.01, tol=0.001) #tol is in seconds
+                                                     maxiter=300, mutation=(0.2,0.6), recombination=0.5,
+                                                     popsize=15, atol=0.01, tol=0.01) # say abs min uncertainty is 0.01 seconds 
         #soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin')
 
         return (soln.x)

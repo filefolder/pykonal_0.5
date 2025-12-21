@@ -213,14 +213,16 @@ cdef class EikonalSolver(object):
         :return: Returns True upon successful execution.
         :rtype:  bool
         """
-        cdef Py_ssize_t                           i, iax, idrxn, iheap
+        cdef Py_ssize_t                           i, iax, jax, idrxn, iheap
+        cdef Py_ssize_t                           nbr1_i1, nbr1_i2, nbr1_i3
+        cdef Py_ssize_t                           nbr2_i1, nbr2_i2, nbr2_i3
         cdef Py_ssize_t[6][3]                     nbrs
         cdef Py_ssize_t[3]                        nbr, switch, max_idx, active_idx
         cdef Py_ssize_t[2]                        drxns = [-1, 1]
         cdef Py_ssize_t[:,:,:]                    heap_index
         cdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) idx
-        cdef int                                  count_a = 0
-        cdef int                                  count_b = 0
+        #cdef int                                  count_a = 0
+        #cdef int                                  count_b = 0
         cdef int                                  inbr
         cdef int[2]                               order
         cdef constants.REAL_t                     a, b, c, bfd, ffd, new
@@ -279,7 +281,7 @@ cdef class EikonalSolver(object):
                 if vv[nbr[0], nbr[1], nbr[2]] > 0:
                     for iax in range(3):
                         switch = [0, 0, 0]
-                        idrxn = 0
+                        #idrxn = 0
                         if norm[nbr[0], nbr[1], nbr[2], iax] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                             continue
@@ -377,9 +379,9 @@ cdef class EikonalSolver(object):
                         elif order[idrxn] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                     a = aa[0] + aa[1] + aa[2]
-                    if a == 0:
-                        count_a += 1
-                        continue
+                    #if a == 0:
+                    #    count_a += 1
+                    #    continue
                     b = bb[0] + bb[1] + bb[2]
                     c = cc[0] + cc[1] + cc[2] - 1/vv[nbr[0], nbr[1], nbr[2]]**2
                     if b**2 < 4*a*c:
@@ -387,7 +389,7 @@ cdef class EikonalSolver(object):
                         # when the discrimnant is negative. This hack
                         # simply sets the discriminant to zero.
                         new = -b / (2*a)
-                        count_b += 1
+                        #count_b += 1
                     else:
                         new = (-b + sqrt(b**2 - 4*a*c)) / (2*a)
                     if new < tt[nbr[0], nbr[1], nbr[2]]:
@@ -413,7 +415,6 @@ cdef class EikonalSolver(object):
         An alias to self.traveltime.trace_ray().
         """
         return (self.traveltime.trace_ray(end))
-
 
 
 
