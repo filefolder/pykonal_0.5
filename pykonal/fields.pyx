@@ -31,8 +31,9 @@ from . import constants
 from . import transformations
 
 # Cython built-in imports.
-from libc.math cimport sqrt, sin
+from libc.math cimport sqrt, sin, isnan
 from libcpp.vector cimport vector as cpp_vector
+from libc.string cimport memcpy
 
 # Third-party Cython imports
 cimport numpy as np
@@ -348,7 +349,6 @@ cdef class ScalarField3D(Field3D):
         elif self.coord_sys == "spherical":
             return (self._gradient_of_spherical())
 
-
     @property
     def values(self):
         """
@@ -425,40 +425,43 @@ cdef class ScalarField3D(Field3D):
         cdef str                                  coord_sys
         cdef np.ndarray[constants.REAL_t, ndim=1] ray_np
         cdef VectorField3D                        grad
+        cdef bint                                 is_spherical
 
         coord_sys = self.coord_sys
+        is_spherical = (coord_sys == "spherical")
         step_size = self.step_size
         grad      = self.gradient
 
         for idx in range(3):
             ray.push_back(end[idx])
-        value = np.inf ### RCP have to change np.infty to np.inf for numpy 2.0
+        value = np.inf # for numpy 2.0
 
         while True:
             point = <constants.REAL_t[:3]>&ray[ray.size()-3]
             try:
                 value_1back = value
                 value = self.value(point)
-                if value >= value_1back or np.isnan(value):
+                if value >= value_1back or isnan(value):
                     ray.resize(ray.size()-3) # drop bad pt
                     break
             except ValueError:
                 return (None)
             gg   = grad.value(point)
             norm = sqrt(gg[0]**2 + gg[1]**2 + gg[2]**2)
-            if np.isnan(norm):
+            if isnan(norm):
                 raise (ValueError("Encountered NaN gradient."))
             for idx in range(3):
                 gg[idx] /= norm
-            if coord_sys == "spherical":
+            if is_spherical:
                 gg[1] /= point[0]
                 gg[2] /= point[0] * sin(point[1])
             for idx in range(3):
                 ray.push_back(point[idx] - step_size * gg[idx])
 
         ray_np = np.empty(ray.size(), dtype=constants.DTYPE_REAL)
-        for idx in range(ray_np.size):
-            ray_np[idx] = ray[idx]
+        #for idx in range(ray_np.size):
+        #    ray_np[idx] = ray[idx]
+        memcpy(&ray_np[0], ray.data(), ray.size() * sizeof(constants.REAL_t))
         return (np.flipud(ray_np.reshape(-1,3)))
 
 

@@ -281,7 +281,7 @@ cdef class EikonalSolver(object):
                 if vv[nbr[0], nbr[1], nbr[2]] > 0:
                     for iax in range(3):
                         switch = [0, 0, 0]
-                        #idrxn = 0
+                        idrxn = 0
                         if norm[nbr[0], nbr[1], nbr[2], iax] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                             continue
@@ -379,9 +379,9 @@ cdef class EikonalSolver(object):
                         elif order[idrxn] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                     a = aa[0] + aa[1] + aa[2]
-                    #if a == 0:
-                    #    count_a += 1
-                    #    continue
+                    if a == 0:
+                    #    count_a += 1 // no longer tracking
+                        continue
                     b = bb[0] + bb[1] + bb[2]
                     c = cc[0] + cc[1] + cc[2] - 1/vv[nbr[0], nbr[1], nbr[2]]**2
                     if b**2 < 4*a*c:
@@ -389,7 +389,7 @@ cdef class EikonalSolver(object):
                         # when the discrimnant is negative. This hack
                         # simply sets the discriminant to zero.
                         new = -b / (2*a)
-                        #count_b += 1
+                        #count_b += 1 // no longer tracking
                     else:
                         new = (-b + sqrt(b**2 - 4*a*c)) / (2*a)
                     if new < tt[nbr[0], nbr[1], nbr[2]]:
