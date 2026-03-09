@@ -558,14 +558,25 @@ class PointSourceSolver(EikonalSolver):
         :return: Returns True upon successful completion.
         :rtype: bool
         """
+        fallback_vv = None
+        fallback_computed = False
+
         for it in range(self.ntheta):
             for ip in range(self.nphi):
                 idx = (0, it, ip)
                 vv = self.near_field.vv.values[idx]
-                if not np.isnan(vv):
-                    self.near_field.tt.values[idx] = self.drho / vv
-                    self.near_field.unknown[idx] = False
-                    self.near_field.trial.push(*idx)
+                if np.isnan(vv):
+                    # a scheme to eliminate NaNs appearing.. set to the minimum but only compute once
+                    if not fallback_computed:
+                        valid_vv = self.near_field.vv.values[~np.isnan(self.near_field.vv.values)]
+                        fallback_vv = np.min(valid_vv) if len(valid_vv) > 0 else None
+                        fallback_computed = True
+                    if fallback_vv is None:
+                        continue
+                    vv = fallback_vv
+                self.near_field.tt.values[idx] = self.drho / vv
+                self.near_field.unknown[idx] = False
+                self.near_field.trial.push(*idx)
 
 
     def initialize_far_field_narrow_band(self) -> bool:
