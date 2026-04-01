@@ -72,7 +72,6 @@ cdef class EikonalSolver(object):
         self.cy_coord_sys = coord_sys
         self.cy_velocity = fields.ScalarField3D(coord_sys=self.coord_sys)
 
-
     @property
     def trial(self):
         """
@@ -186,7 +185,6 @@ cdef class EikonalSolver(object):
         """
         return (self.traveltime)
 
-
     @property
     def velocity(self):
         """
@@ -204,12 +202,13 @@ cdef class EikonalSolver(object):
         return (self.velocity)
 
     @cython.initializedcheck(False)
-    cpdef constants.BOOL_t solve(EikonalSolver self):
+    cpdef constants.BOOL_t solve(EikonalSolver self, constants.REAL_t max_traveltime=np.inf):
         """
-        solve(self)
+        solve(self,max_traveltime)
 
         Solve the Eikonal equation using the FMM.
-
+        :new arg "max_traveltime" which limits the range of tracing
+                 this is primarily for PyVoroTomo to save processing for sparse models
         :return: Returns True upon successful execution.
         :rtype:  bool
         """
@@ -233,6 +232,7 @@ cdef class EikonalSolver(object):
         cdef constants.BOOL_t[3]                  iax_isperiodic,
         cdef constants.BOOL_t[:,:,:]              known, unknown
         cdef heapq.Heap                           trial
+        cdef constants.REAL_t                     max_traveltime_c = max_traveltime
 
         for iax in range(3):
             max_idx[iax] = <Py_ssize_t> self.cy_traveltime.cy_npts[iax]
@@ -246,11 +246,15 @@ cdef class EikonalSolver(object):
         trial = self.trial
         heap_index = trial.cy_heap_index
 
-
         while trial.cy_keys.size() > 0:
             # Let Active be the point in Trial with the smallest
             # traveltime value.
             idx = trial.pop()
+
+            # NEW: early exit once wavefront exceeds the limit
+            if tt[idx[0], idx[1], idx[2]] > max_traveltime_c:
+                break
+
             active_idx = [idx[0], idx[1], idx[2]]
             known[active_idx[0], active_idx[1], active_idx[2]] = True
 
@@ -668,7 +672,7 @@ class PointSourceSolver(EikonalSolver):
         return (True)
 
 
-    def solve(self):
+    def solve(self, max_traveltime=np.inf):
         """
         Solve the Eikonal equation on the far-field grid using the
         refined source grid in the near-field region.
@@ -690,7 +694,7 @@ class PointSourceSolver(EikonalSolver):
         # Initialize the narrow band of the far-field grid.
         self.initialize_far_field_narrow_band()
         # Propagate the wavefront through the far field.
-        super(PointSourceSolver, self).solve()
+        super(PointSourceSolver, self).solve(max_traveltime=max_traveltime)
         return (True)
 
 
