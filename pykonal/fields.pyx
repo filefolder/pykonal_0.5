@@ -131,7 +131,8 @@ cdef class Field3D(object):
     def node_intervals(self, value):
         value = np.asarray(value, dtype=constants.DTYPE_REAL)
         if np.any(value <= 0):
-            raise (ValueError("All node intervals must be > 0"))
+            raise ValueError("All node intervals must be > 0")
+
         self.cy_node_intervals = value
         self._update_max_coords()
         self._update_iax_isperiodic()
@@ -447,7 +448,7 @@ cdef class ScalarField3D(Field3D):
             except ValueError:
                 return (None)
             gg   = grad.value(point)
-            norm = sqrt(gg[0]**2 + gg[1]**2 + gg[2]**2)
+            norm = sqrt(gg[0]*gg[0] + gg[1]*gg[1] + gg[2]*gg[2])
             if isnan(norm):
                 raise (ValueError("Encountered NaN gradient."))
             for idx in range(3):
@@ -462,7 +463,7 @@ cdef class ScalarField3D(Field3D):
         #for idx in range(ray_np.size):
         #    ray_np[idx] = ray[idx]
         memcpy(&ray_np[0], ray.data(), ray.size() * sizeof(constants.REAL_t))
-        return (np.flipud(ray_np.reshape(-1,3)))
+        return np.flipud(ray_np.reshape(-1,3))
 
 
     cpdef constants.REAL_t value(
@@ -506,6 +507,7 @@ cdef class ScalarField3D(Field3D):
             if self.cy_iax_isnull[iax]:
                 ii[iax][0] = 0
                 ii[iax][1] = 0
+
             else:
                 ii[iax][0]  = <Py_ssize_t>idx[iax]
                 ii[iax][1]  = <Py_ssize_t>(ii[iax][0]+1) % self.npts[iax]
@@ -514,6 +516,7 @@ cdef class ScalarField3D(Field3D):
                     return null
 
             delta[iax] = idx[iax] % 1
+
         f000    = self.cy_values[ii[0][0], ii[1][0], ii[2][0]]
         f100    = self.cy_values[ii[0][1], ii[1][0], ii[2][0]]
         f110    = self.cy_values[ii[0][1], ii[1][1], ii[2][0]]
@@ -529,7 +532,7 @@ cdef class ScalarField3D(Field3D):
         f0      = f00  + (f10  - f00)  * delta[1]
         f1      = f01  + (f11  - f01)  * delta[1]
         f       = f0   + (f1   - f0)   * delta[2]
-        return (f)
+        return f
 
 
     cpdef VectorField3D _gradient_of_cartesian(ScalarField3D self):
@@ -557,7 +560,7 @@ cdef class ScalarField3D(Field3D):
         grad.node_intervals = self.node_intervals
         grad.npts = self.npts
         grad.values = gg
-        return (grad)
+        return grad
 
 
     cpdef VectorField3D _gradient_of_spherical(ScalarField3D self):
@@ -649,7 +652,7 @@ cdef class ScalarField3D(Field3D):
         grad.node_intervals = self.node_intervals
         grad.npts = self.npts
         grad.values = gg
-        return (grad)
+        return grad
 
 cdef class VectorField3D(Field3D):
     """
@@ -668,10 +671,10 @@ cdef class VectorField3D(Field3D):
         Value of the field at each grid node.
         """
         try:
-            return (np.asarray(self.cy_values))
+            return np.asarray(self.cy_values)
         except AttributeError:
             self.cy_values = np.full(self.npts, fill_value=np.nan)
-        return (np.asarray(self.cy_values))
+        return np.asarray(self.cy_values)
 
     @values.setter
     def values(self, value):
@@ -742,7 +745,7 @@ cdef class VectorField3D(Field3D):
             f1      = f01  + (f11  - f01)  * delta[1]
             f       = f0   + (f1   - f0)   * delta[2]
             ff[iax] = f
-        return (np.asarray(ff))
+        return np.asarray(ff)
 
 
 cpdef Field3D load(str path):
@@ -773,7 +776,7 @@ cpdef Field3D load(str path):
         field.node_intervals = npz["node_intervals"]
         field.npts = npz["npts"]
         field.values = npz["values"]
-    return (field)
+    return field
 
 
 def read_hdf(path, min_coords=None, max_coords=None):
@@ -793,7 +796,7 @@ def read_hdf(path, min_coords=None, max_coords=None):
     :return: A Field3D-derivative class initialized with data in *path*.
     :rtype: ScalarField3D or VectorField3D
     """
-    
+
     with h5py.File(path, mode="r") as f5:
 
         _coord_sys = f5.attrs["coord_sys"]
@@ -801,41 +804,33 @@ def read_hdf(path, min_coords=None, max_coords=None):
         _min_coords = f5["min_coords"][:]
         _node_intervals = f5["node_intervals"][:]
         _npts = f5["npts"][:]
-        
+
         if min_coords is not None:
-            
             min_coords = np.array(min_coords)
-            
+
         if max_coords is not None:
-            
             max_coords = np.array(max_coords)
-        
+
         if min_coords is not None and max_coords is not None:
-            
             if np.any(min_coords >= max_coords):
-                
                 raise(ValueError("All values of min_coords must satisfy min_coords < max_coords."))
-        
+
         if min_coords is not None:
-            
             idx_start = (min_coords - _min_coords) / _node_intervals
             idx_start = np.floor(idx_start)
             idx_start = idx_start.astype(np.int32)
             idx_start = np.clip(idx_start, 0, _npts - 1)
-            
+
         else:
-            
             idx_start = np.array([0, 0, 0])
-            
+
         if max_coords is not None:
-            
             idx_end = (max_coords - _min_coords) / _node_intervals
             idx_end = np.ceil(idx_end) + 1
             idx_end = idx_end.astype(np.int32)
             idx_end = np.clip(idx_end, idx_start + 1, _npts)
-            
+
         else:
-            
             idx_end = _npts
 
         if _field_type == "scalar":
@@ -844,10 +839,11 @@ def read_hdf(path, min_coords=None, max_coords=None):
             field = VectorField3D(coord_sys=_coord_sys)
         else:
             raise (ValueError(f"Unrecognized field type: {_field_type}"))
+
         field.min_coords = _min_coords  +  idx_start * _node_intervals
         field.node_intervals = _node_intervals
         field.npts = idx_end - idx_start
         idxs = tuple(slice(idx_start[idx], idx_end[idx]) for idx in range(3))
         field.values = f5["values"][idxs]
 
-    return (field)
+    return field

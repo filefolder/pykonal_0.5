@@ -80,7 +80,7 @@ cdef class EikonalSolver(object):
         """
         if self.cy_trial is None:
             self.cy_trial = heapq.Heap(self.traveltime.values)
-        return (self.cy_trial)
+        return self.cy_trial
 
     @property
     def coord_sys(self):
@@ -88,8 +88,7 @@ cdef class EikonalSolver(object):
         [*Read only*, str] Coordinate system of solver
         {"Cartesian", "spherical"}.
         """
-        return (self.cy_coord_sys)
-
+        return self.cy_coord_sys
 
     @property
     def known(self):
@@ -101,7 +100,7 @@ cdef class EikonalSolver(object):
             return (np.asarray(self.cy_known))
         except AttributeError:
             self.cy_known = np.zeros(self.tt.npts, dtype=constants.DTYPE_BOOL)
-        return (np.asarray(self.cy_known))
+        return np.asarray(self.cy_known)
 
     @property
     def unknown(self):
@@ -113,8 +112,7 @@ cdef class EikonalSolver(object):
             return (np.asarray(self.cy_unknown))
         except AttributeError:
             self.cy_unknown = np.ones(self.tt.npts, dtype=constants.DTYPE_BOOL)
-        return (np.asarray(self.cy_unknown))
-
+        return np.asarray(self.cy_unknown)
 
 
     @property
@@ -144,7 +142,7 @@ cdef class EikonalSolver(object):
                 norm[..., 2] *= self.traveltime.nodes[..., 0]
                 norm[..., 2] *= np.sin(self.traveltime.nodes[..., 1])
             self.cy_norm = norm
-        return (np.asarray(self.cy_norm))
+        return np.asarray(self.cy_norm)
 
     @property
     def step_size(self):
@@ -160,7 +158,7 @@ cdef class EikonalSolver(object):
             ".traveltime.step_size instead."
         warnings.warn(warning_message, DeprecationWarning)
 
-        return (self.norm[~np.isclose(self.norm, 0)].min() / 4)
+        return self.norm[~np.isclose(self.norm, 0)].min() / 4
 
 
     @property
@@ -175,7 +173,7 @@ cdef class EikonalSolver(object):
             self.cy_traveltime.node_intervals = self.velocity.node_intervals
             self.cy_traveltime.npts = self.velocity.npts
             self.cy_traveltime.values = np.full_like(self.velocity.values, fill_value=np.inf)
-        return (self.cy_traveltime)
+        return self.cy_traveltime
 
     @property
     def tt(self):
@@ -183,7 +181,7 @@ cdef class EikonalSolver(object):
         [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] Alias for
         self.traveltime.
         """
-        return (self.traveltime)
+        return self.traveltime
 
     @property
     def velocity(self):
@@ -191,7 +189,7 @@ cdef class EikonalSolver(object):
         [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] 3D array
         of velocity values.
         """
-        return (self.cy_velocity)
+        return self.cy_velocity
 
     @property
     def vv(self):
@@ -199,8 +197,9 @@ cdef class EikonalSolver(object):
         [*Read/Write*, :class:`pykonal.fields.ScalarField3D`] Alias for
         self.velocity.
         """
-        return (self.velocity)
+        return self.velocity
 
+    @cython.boundscheck(True)
     @cython.initializedcheck(False)
     cpdef constants.BOOL_t solve(EikonalSolver self, constants.REAL_t max_traveltime=np.inf):
         """
@@ -220,8 +219,6 @@ cdef class EikonalSolver(object):
         cdef Py_ssize_t[2]                        drxns = [-1, 1]
         cdef Py_ssize_t[:,:,:]                    heap_index
         cdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) idx
-        #cdef int                                  count_a = 0
-        #cdef int                                  count_b = 0
         cdef int                                  inbr
         cdef int[2]                               order
         cdef constants.REAL_t                     a, b, c, bfd, ffd, new
@@ -233,6 +230,8 @@ cdef class EikonalSolver(object):
         cdef constants.BOOL_t[:,:,:]              known, unknown
         cdef heapq.Heap                           trial
         cdef constants.REAL_t                     max_traveltime_c = max_traveltime
+        cdef constants.REAL_t                     norm_iax, norm_iax_sq, denom_iax
+        cdef constants.REAL_t                     tt_nbr, v_nbr, tt1, tt2
 
         for iax in range(3):
             max_idx[iax] = <Py_ssize_t> self.cy_traveltime.cy_npts[iax]
@@ -247,8 +246,7 @@ cdef class EikonalSolver(object):
         heap_index = trial.cy_heap_index
 
         while trial.cy_keys.size() > 0:
-            # Let Active be the point in Trial with the smallest
-            # traveltime value.
+            # Let Active be the point in Trial with the smallest traveltime value.
             idx = trial.pop()
 
             # NEW: early exit once wavefront exceeds the limit
@@ -270,8 +268,7 @@ cdef class EikonalSolver(object):
                                   active_idx[jax]
                                 + switch[jax]
                                 + max_idx[jax]
-                            )\
-                            % max_idx[jax]
+                            ) % max_idx[jax]
                         else:
                             nbrs[inbr][jax] = active_idx[jax] + switch[jax]
                     inbr += 1
@@ -282,13 +279,20 @@ cdef class EikonalSolver(object):
                 nbr    = nbrs[i]
                 if not stencil(nbr[0], nbr[1], nbr[2], max_idx[0], max_idx[1], max_idx[2]) or known[nbr[0], nbr[1], nbr[2]]:
                     continue
-                if vv[nbr[0], nbr[1], nbr[2]] > 0:
+                v_nbr  = vv[nbr[0], nbr[1], nbr[2]]
+                tt_nbr = tt[nbr[0], nbr[1], nbr[2]]
+                if v_nbr > 0:
                     for iax in range(3):
-                        switch = [0, 0, 0]
-                        idrxn = 0
-                        if norm[nbr[0], nbr[1], nbr[2], iax] == 0:
+
+                        norm_iax = norm[nbr[0], nbr[1], nbr[2], iax]
+                        if norm_iax == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                             continue
+                        switch = [0, 0, 0]
+                        idrxn = 0
+                        norm_iax_sq = norm_iax * norm_iax
+                        denom_iax = 4.0 * norm_iax_sq
+
                         for idrxn in range(2):
                             switch[iax] = drxns[idrxn]
                             nbr1_i1 = (nbr[0]+switch[0]+max_idx[0]) % max_idx[0]\
@@ -320,11 +324,11 @@ cdef class EikonalSolver(object):
                                     <= tt[nbr1_i1, nbr1_i2, nbr1_i3]\
                             :
                                 order[idrxn] = 2
+                                tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                                tt2 = tt[nbr2_i1, nbr2_i2, nbr2_i3]
                                 fdu[idrxn]  = drxns[idrxn] * (
-                                    - 3 * tt[nbr[0], nbr[1], nbr[2]]
-                                    + 4 * tt[nbr1_i1, nbr1_i2, nbr1_i3]
-                                    -     tt[nbr2_i1, nbr2_i2, nbr2_i3]
-                                ) / (2 * norm[nbr[0], nbr[1], nbr[2], iax])
+                                    -3.0 * tt_nbr + 4.0 * tt1 - tt2
+                                ) / (2.0 * norm_iax)
                             elif (
                                 (
                                     drxns[idrxn] == -1
@@ -338,10 +342,8 @@ cdef class EikonalSolver(object):
                                 and known[nbr1_i1, nbr1_i2, nbr1_i3]\
                             :
                                 order[idrxn] = 1
-                                fdu[idrxn] = drxns[idrxn] * (
-                                    tt[nbr1_i1, nbr1_i2, nbr1_i3]
-                                  - tt[nbr[0], nbr[1], nbr[2]]
-                                ) / norm[nbr[0], nbr[1], nbr[2], iax]
+                                tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                                fdu[idrxn] = drxns[idrxn] * (tt1 - tt_nbr) / norm_iax
                             else:
                                 order[idrxn], fdu[idrxn] = 0, 0
                         if fdu[0] > -fdu[1]:
@@ -363,40 +365,33 @@ cdef class EikonalSolver(object):
                         nbr2_i3 = (nbr[2]+2*switch[2]+max_idx[2]) % max_idx[2]\
                             if iax_isperiodic[2] else nbr[2]+2*switch[2]
                         if order[idrxn] == 2:
-                            aa[iax] = 9 / (4*norm[nbr[0], nbr[1], nbr[2], iax] ** 2)
-                            bb[iax] = (
-                                6 * tt[nbr2_i1, nbr2_i2, nbr2_i3]
-                             - 24 * tt[nbr1_i1, nbr1_i2, nbr1_i3]
-                            ) / (4 * norm[nbr[0], nbr[1], nbr[2], iax]**2)
-                            cc[iax] = (
-                                       tt[nbr2_i1, nbr2_i2, nbr2_i3]**2
-                                -  8 * tt[nbr2_i1, nbr2_i2, nbr2_i3]
-                                     * tt[nbr1_i1, nbr1_i2, nbr1_i3]
-                                + 16 * tt[nbr1_i1, nbr1_i2, nbr1_i3]**2
-                            ) / (4 * norm[nbr[0], nbr[1], nbr[2], iax]**2)
+                            tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                            tt2 = tt[nbr2_i1, nbr2_i2, nbr2_i3]
+                            aa[iax] = 9.0 / denom_iax
+                            bb[iax] = (6.0 * tt2 - 24.0 * tt1) / denom_iax
+                            cc[iax] = (tt2*tt2 - 8.0*tt2*tt1 + 16.0*tt1*tt1) / denom_iax
                         elif order[idrxn] == 1:
-                            aa[iax] = 1 / norm[nbr[0], nbr[1], nbr[2], iax]**2
-                            bb[iax] = -2 * tt[nbr1_i1, nbr1_i2, nbr1_i3]\
-                                / norm[nbr[0], nbr[1], nbr[2], iax] ** 2
-                            cc[iax] = tt[nbr1_i1, nbr1_i2, nbr1_i3]**2\
-                                / norm[nbr[0], nbr[1], nbr[2], iax]**2
+                            tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
+                            aa[iax] = 1.0 / norm_iax_sq
+                            bb[iax] = -2.0 * tt1 / norm_iax_sq
+                            cc[iax] = tt1 * tt1 / norm_iax_sq
                         elif order[idrxn] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                     a = aa[0] + aa[1] + aa[2]
-                    if a == 0:
+                    if a < 1e-20:
                     #    count_a += 1 // no longer tracking
                         continue
                     b = bb[0] + bb[1] + bb[2]
-                    c = cc[0] + cc[1] + cc[2] - 1/vv[nbr[0], nbr[1], nbr[2]]**2
-                    if b**2 < 4*a*c:
+                    c = cc[0] + cc[1] + cc[2] - 1.0/(v_nbr*v_nbr)
+                    if b*b < 4*a*c:
                         # This is a hack to solve the quadratic equation
                         # when the discrimnant is negative. This hack
                         # simply sets the discriminant to zero.
-                        new = -b / (2*a)
+                        new = -b/(2*a)
                         #count_b += 1 // no longer tracking
                     else:
-                        new = (-b + sqrt(b**2 - 4*a*c)) / (2*a)
-                    if new < tt[nbr[0], nbr[1], nbr[2]]:
+                        new = (-b + sqrt(b*b - 4*a*c)) / (2*a)
+                    if new < tt_nbr:
                         tt[nbr[0], nbr[1], nbr[2]] = new
                         # Tag as Trial all neighbours of Active that are not
                         # Alive. If the neighbour is in Far, remove it from
@@ -406,7 +401,7 @@ cdef class EikonalSolver(object):
                             unknown[nbr[0], nbr[1], nbr[2]] = False
                         else:
                             trial.sift_down(0, heap_index[nbr[0], nbr[1], nbr[2]])
-        return (True)
+        return True
 
 
     cpdef np.ndarray[constants.REAL_t, ndim=2] trace_ray(
@@ -418,8 +413,7 @@ cdef class EikonalSolver(object):
 
         An alias to self.traveltime.trace_ray().
         """
-        return (self.traveltime.trace_ray(end))
-
+        return self.traveltime.trace_ray(end)
 
 
 class PointSourceSolver(EikonalSolver):
@@ -446,7 +440,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_dphi"):
             self._dphi = (2 * np.pi) / self.nphi
-        return (self._dphi)
+        return self._dphi
 
     @dphi.setter
     def dphi(self, value):
@@ -463,7 +457,7 @@ class PointSourceSolver(EikonalSolver):
                 self._drho = self.vv.node_intervals.min() / 8
             else:
                 self._drho = self.vv.node_intervals[0] / 8
-        return (self._drho)
+        return self._drho
 
     @drho.setter
     def drho(self, value):
@@ -477,7 +471,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_dtheta"):
             self._dtheta = np.pi / (self.ntheta - 1)
-        return (self._dtheta)
+        return self._dtheta
 
     @dtheta.setter
     def dtheta(self, value):
@@ -491,7 +485,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_nphi"):
             self._nphi = 64
-        return (self._nphi)
+        return self._nphi
 
     @property
     def nrho(self):
@@ -501,7 +495,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_nrho"):
             self._nrho = 64
-        return (self._nrho)
+        return self._nrho
 
     @nrho.setter
     def nrho(self, value):
@@ -515,7 +509,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_ntheta"):
             self._ntheta = 33
-        return (self._ntheta)
+        return self._ntheta
 
     @property
     def near_field(self):
@@ -525,7 +519,7 @@ class PointSourceSolver(EikonalSolver):
         """
         if not hasattr(self, "_near_field"):
             self._near_field = EikonalSolver(coord_sys="spherical")
-        return (self._near_field)
+        return self._near_field
 
     @property
     def src_loc(self):
@@ -533,7 +527,7 @@ class PointSourceSolver(EikonalSolver):
         [*Read/Write*, (float, float, float)] Location of the point
         source in the coordinates of the far-field grid.
         """
-        return (self._src_loc)
+        return self._src_loc
 
     @src_loc.setter
     def src_loc(self, value):
@@ -551,7 +545,7 @@ class PointSourceSolver(EikonalSolver):
         self.near_field.vv.min_coords = self.drho, 0, 0
         self.near_field.vv.node_intervals = self.drho, self.dtheta, self.dphi
         self.near_field.vv.npts = self.nrho, self.ntheta, self.nphi
-        return (True)
+        return True
 
 
     def initialize_near_field_narrow_band(self) -> bool:
@@ -669,7 +663,7 @@ class PointSourceSolver(EikonalSolver):
         idxs = np.nonzero(bool_idx)
         # Sample the far-field velocity model on the near-field nodes.
         self.near_field.vv.values[idxs] = self.vv.resample(nodes[idxs].reshape(-1, 3))
-        return (True)
+        return True
 
 
     def solve(self, max_traveltime=np.inf):
@@ -695,9 +689,7 @@ class PointSourceSolver(EikonalSolver):
         self.initialize_far_field_narrow_band()
         # Propagate the wavefront through the far field.
         super(PointSourceSolver, self).solve(max_traveltime=max_traveltime)
-        return (True)
-
-
+        return True
 
 
 cdef inline bint stencil(

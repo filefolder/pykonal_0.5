@@ -1,6 +1,6 @@
 # Cython compiler directives.
 # distutils: language=c++
-# cython: profile=True
+# cython: profile=False
 
 
 import numpy as np
@@ -21,7 +21,6 @@ from libc.math cimport sqrt, isinf, isnan, INFINITY
 from . cimport fields
 from . cimport constants
 
-#inf = np.inf
 
 cdef class EQLocator(object):
     """
@@ -36,11 +35,13 @@ cdef class EQLocator(object):
     ):
         self.cy_arrivals = {}
         self.cy_traveltimes = {}
+        self.cy_residual_rvs = {}
         self.cy_coord_sys = coord_sys
-        inventory = _inventory.TraveltimeInventory(
-            traveltime_inventory, 
-            mode="r"
-        )
+        # new for adding uncertainty
+        self.cy_sigma_pick    = 0.02
+        self.cy_alpha         = 0.01
+
+        inventory = _inventory.TraveltimeInventory(traveltime_inventory, mode="r")
         self.cy_traveltime_inventory = inventory
 
 
@@ -49,7 +50,7 @@ cdef class EQLocator(object):
 
 
     def __enter__(self):
-        return (self)
+        return self
 
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
@@ -58,27 +59,27 @@ cdef class EQLocator(object):
 
     cpdef constants.BOOL_t add_arrivals(EQLocator self, dict arrivals):
         self.cy_arrivals = {**self.cy_arrivals, **arrivals}
-        return (True)
+        return True
 
 
     cpdef constants.BOOL_t add_residual_rvs(EQLocator self, dict residual_rvs):
         self.cy_residual_rvs = {**self.cy_residual_rvs, **residual_rvs}
-        return (True)
+        return True
 
 
     cpdef constants.BOOL_t clear_arrivals(EQLocator self):
         self.cy_arrivals = {}
-        return (True)
+        return True
 
 
     cpdef constants.BOOL_t clear_residual_rvs(EQLocator self):
         self.cy_residual_rvs = {}
-        return (True)
+        return True
         
     
     @property
     def arrivals(self) -> dict:
-        return (self.cy_arrivals)
+        return self.cy_arrivals
     
     @arrivals.setter
     def arrivals(self, value: dict):
@@ -86,17 +87,17 @@ cdef class EQLocator(object):
 
     @property
     def coord_sys(self) -> str:
-        return (self.cy_coord_sys)
+        return self.cy_coord_sys
 
     @property
     def grid(self) -> object:
         if self.cy_grid is None:
             self.cy_grid = fields.ScalarField3D(coord_sys=self.cy_coord_sys)
-        return (self.cy_grid)
+        return self.cy_grid
 
     @property
     def traveltime_inventory(self) -> object:
-        return (self.cy_traveltime_inventory)
+        return self.cy_traveltime_inventory
 
     @property
     def pwave_velocity(self) -> object:
@@ -107,7 +108,7 @@ cdef class EQLocator(object):
             self.cy_pwave_velocity.min_coords = self.cy_grid.min_coords
             self.cy_pwave_velocity.node_intervals = self.cy_grid.node_intervals
             self.cy_pwave_velocity.npts = self.cy_grid.npts
-        return (self.cy_pwave_velocity)
+        return self.cy_pwave_velocity
     
     @pwave_velocity.setter
     def pwave_velocity(self, value: np.ndarray):
@@ -117,7 +118,7 @@ cdef class EQLocator(object):
     
     @property
     def vp(self) -> object:
-        return (self.pwave_velocity)
+        return self.pwave_velocity
     
     @vp.setter
     def vp(self, value: np.ndarray):
@@ -125,7 +126,7 @@ cdef class EQLocator(object):
 
     @property
     def residual_rvs(self) -> dict:
-        return (self.cy_residual_rvs)
+        return self.cy_residual_rvs
     
     @residual_rvs.setter
     def residual_rvs(self, value: dict):
@@ -140,7 +141,7 @@ cdef class EQLocator(object):
             self.cy_swave_velocity.min_coords = self.cy_grid.min_coords
             self.cy_swave_velocity.node_intervals = self.cy_grid.node_intervals
             self.cy_swave_velocity.npts = self.cy_grid.npts
-        return (self.cy_swave_velocity)
+        return self.cy_swave_velocity
     
     @swave_velocity.setter
     def swave_velocity(self, value: np.ndarray):
@@ -150,7 +151,7 @@ cdef class EQLocator(object):
         
     @property
     def traveltimes(self) -> dict:
-        return (self.cy_traveltimes)
+        return self.cy_traveltimes
     
     @traveltimes.setter
     def traveltimes(self, value: dict):
@@ -158,12 +159,31 @@ cdef class EQLocator(object):
         
     @property
     def vs(self) -> object:
-        return (self.swave_velocity)
+        return self.swave_velocity
 
     @vs.setter
     def vs(self, value: np.ndarray):
         self.swave_velocity = value
 
+    @property
+    def sigma_pick(self):
+        return self.cy_sigma_pick
+
+    @sigma_pick.setter
+    def sigma_pick(self, value):
+        if value < 0:
+            raise ValueError("sigma_pick must be >= 0")
+        self.cy_sigma_pick = value
+
+    @property
+    def alpha(self):
+        return self.cy_alpha
+
+    @alpha.setter
+    def alpha(self, value):
+        if value < 0:
+            raise ValueError("alpha must be >= 0")
+        self.cy_alpha = value
 
     cpdef constants.BOOL_t read_traveltimes(
         EQLocator self, 
@@ -182,19 +202,7 @@ cdef class EQLocator(object):
 
         return True
 
-
-    #cpdef np.ndarray[constants.REAL_t, ndim=1] grid_search(EQLocator self):
-    #    values = [self.cy_arrivals[key]-np.ma.masked_invalid(self.cy_traveltimes[key].values) for key in self.cy_traveltimes]
-    #    values = np.stack(values)
-    #    std = values.std(axis=0)
-    #    arg_min = np.argmin(std)
-    #    idx_min = np.unravel_index(arg_min, std.shape)
-    #    coords = self.cy_grid.nodes[idx_min]
-    #    time = values.mean(axis=0)[idx_min]
-    #    return (np.array([*coords, time], dtype=_constants.DTYPE_REAL))
-
-    #
-    # UPDATED RCP
+    """
     cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):
         cdef tuple key
         cdef dict arrivals = self.cy_arrivals
@@ -202,34 +210,77 @@ cdef class EQLocator(object):
         cdef constants.REAL_t csum = 0
         cdef constants.REAL_t num
         cdef constants.REAL_t tt
+        cdef constants.REAL_t arrival_time
         cdef constants.REAL_t t0 = hypocenter[3]
         cdef constants.REAL_t[:] hypo_xyz = hypocenter[:3]
+        cdef int valid_measurements = 0
+        cdef fields.ScalarField3D tt_field
+
+        for key, arrival_time in arrivals.items():
+            tt_field = traveltimes[key]
+            tt = tt_field.value(hypo_xyz, null=INFINITY)
+            if isnan(tt) or tt > 9999:
+                continue
+            num = arrival_time - t0 - tt
+            csum += num * num
+            valid_measurements += 1
+
+        if valid_measurements == 0:
+            return 1e6
+
+        return sqrt(csum / valid_measurements)
+    """
+
+    # weighted RMS (new)
+    cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):
+        cdef tuple key
+        cdef dict arrivals = self.cy_arrivals
+        cdef dict traveltimes = self.cy_traveltimes
+        cdef constants.REAL_t csum = 0
+        cdef constants.REAL_t weight_sum = 0
+        cdef constants.REAL_t num
+        cdef constants.REAL_t tt
+        cdef constants.REAL_t variance
+        cdef constants.REAL_t weight
+        cdef constants.REAL_t t0 = hypocenter[3]
+        cdef constants.REAL_t[:] hypo_xyz = hypocenter[:3]
+        cdef constants.REAL_t sigma_pick_sq = self.cy_sigma_pick * self.cy_sigma_pick
+        cdef constants.REAL_t alpha_sq = self.cy_alpha * self.cy_alpha
         cdef int valid_measurements = 0
 
         for key in arrivals:
             tt = traveltimes[key].value(hypo_xyz, null=INFINITY)
-            if isinf(tt) or isnan(tt) or tt>9999: # use c's isinf and isnan, set otherwise to Very Large Number RCP
-                continue  # Skip invalid measurements
+            if isinf(tt) or isnan(tt) or tt > 9999:
+                continue
             num = arrivals[key] - t0 - tt
-            csum += num * num
+            variance = sigma_pick_sq + alpha_sq * tt * tt
+            weight = 1.0 / variance
+            csum += weight * num * num
+            weight_sum += weight
             valid_measurements += 1
-        
+
         if valid_measurements == 0:
-            return 1e6 # np.inf  # Tell optimizer this is a bad point (RCP using Very Large Number instead)
-            
-        return (sqrt(csum/valid_measurements))
+            return 1e6
+
+        return sqrt(csum / weight_sum)
 
 
     cpdef np.ndarray[constants.REAL_t, ndim=1] locate(
         EQLocator self,
         np.ndarray[constants.REAL_t, ndim=1] initial,
-        np.ndarray[constants.REAL_t, ndim=1] delta
+        np.ndarray[constants.REAL_t, ndim=1] delta,
+        constants.REAL_t sigma_pick=0.02, 
+        constants.REAL_t alpha=0.01        
     ):
         """
         Locate event using a grid search and Differential Evolution
         Optimization to minimize the residual RMS.
+        sigma_pick (seconds) picking precision floor
+        alpha = fractional traveltime error in % 
         """
-       
+        self.cy_sigma_pick = sigma_pick
+        self.cy_alpha = alpha
+      
         min_coords = initial - delta
         max_coords = initial + delta
 
@@ -241,12 +292,35 @@ cdef class EQLocator(object):
         )
 
         # RCP added some kwargs
-        soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin', updating='immediate', 
-                                                     maxiter=200, mutation=(0.2,0.6), recombination=0.5,
-                                                     popsize=17, atol=0.005, tol=0.005) # say abs min uncertainty is 0.005 seconds 
-        #soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin')
+        soln = scipy.optimize.differential_evolution(self.rms, bounds,
+                                                     x0 = initial, # recent scipy allows an initial estimate 
+                                                     strategy='best1bin', updating='immediate', 
+                                                     maxiter=200, mutation=(0.3,1.0), recombination=0.7,
+                                                     popsize=20, atol=0.01, tol=0.01, init='sobol',
+                                                     polish=False)
+        #soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin') # original
 
-        return (soln.x)
+        # Polish (find the bottom of the basin)
+        polished = scipy.optimize.minimize(
+            self.rms, soln.x,
+            method='Nelder-Mead',
+            options={
+                'xatol': 0.05,    # 50 m / 50 ms — tighter than DE could give
+                'fatol': 0.005,   # 5 ms RMS resolution
+                'maxiter': 100,
+            },
+        )
+
+        final_x = polished.x if polished.fun < soln.fun else soln.x
+
+        # so the solution is the minium rms in the DE cloud (shape (4,) x,y,z,t)
+        # we could at some point accept/reject based on this - send to pyvorotomo to boot events
+        # final_rms = min(polished.fun, soln.fun)
+        # soln_std = np.std(soln.population, axis=0) # n.b. this is pre-polish
+        # return final_x,final_rms,soln_std
+
+        return final_x
+
 
     cpdef constants.REAL_t log_likelihood(
         EQLocator self,
@@ -255,7 +329,6 @@ cdef class EQLocator(object):
         cdef constants.REAL_t   t_pred, residual
         cdef constants.REAL_t   log_likelihood = 0.0
         cdef tuple              key
-        cdef EQLocator[:]       junk
 
         for key in self.cy_arrivals:
             t_pred = model[3] + self.cy_traveltimes[key].value(model[:3])

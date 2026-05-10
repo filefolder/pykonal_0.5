@@ -43,7 +43,7 @@ cdef class Heap(object):
         Array of indices indicating the heap position of each node. 
         Index -1 indicates that a node is not on the heap.
         """
-        return (np.asarray(self.cy_heap_index, dtype=constants.DTYPE_INT))
+        return np.asarray(self.cy_heap_index, dtype=constants.DTYPE_INT)
 
     @property
     def keys(self):
@@ -56,16 +56,14 @@ cdef class Heap(object):
         for i in range(self.cy_keys.size()):
             idx = self.cy_keys[i]
             output.append((idx.i1, idx.i2, idx.i3))
-        return (output)
-
+        return output
 
     @property
     def size(self):
         """
         [*Read only*, int] Number of node indices on the heap.
         """
-        return (self.cy_keys.size())
-
+        return self.cy_keys.size()
 
     @property
     def values(self):
@@ -102,7 +100,7 @@ cdef class Heap(object):
             self.cy_heap_index[last.i1, last.i2, last.i3] = 0
             self.sift_up(0)
             return ((idx_return.i1, idx_return.i2, idx_return.i3))
-        return ((last.i1, last.i2, last.i3))
+        return (last.i1, last.i2, last.i3)
 
     cpdef constants.BOOL_t push(Heap self, Py_ssize_t i1, Py_ssize_t i2, Py_ssize_t i3):
         """
@@ -127,8 +125,7 @@ cdef class Heap(object):
         self.cy_keys.push_back(idx)
         self.cy_heap_index[idx.i1, idx.i2, idx.i3] = self.cy_keys.size()-1
         self.sift_down(0, self.cy_keys.size()-1)
-        return (True)
-
+        return True
 
     cpdef constants.BOOL_t sift_down(Heap self, Py_ssize_t j_start, Py_ssize_t j):
         """
@@ -163,7 +160,7 @@ cdef class Heap(object):
             break
         self.cy_keys[j] = idx_new
         self.cy_heap_index[idx_new.i1, idx_new.i2, idx_new.i3] = j
-        return (True)
+        return True
 
 
     cpdef constants.BOOL_t sift_up(Heap self, Py_ssize_t j_start):
@@ -189,12 +186,15 @@ cdef class Heap(object):
         while j_child < j_end:
             # Set childpos to index of smaller child.
             j_right = j_child + 1
-            idx_child, idx_right = self.cy_keys[j_child], self.cy_keys[j_right]
-            if j_right < j_end and not self.cy_values[idx_child.i1, idx_child.i2, idx_child.i3] < self.cy_values[idx_right.i1, idx_right.i2, idx_right.i3]:
-                j_child = j_right
+            idx_child = self.cy_keys[j_child]
+            if j_right < j_end:
+                idx_right = self.cy_keys[j_right]
+                if not self.cy_values[idx_child.i1, idx_child.i2, idx_child.i3] < self.cy_values[idx_right.i1, idx_right.i2, idx_right.i3]:
+                    j_child = j_right            
             # Move the smaller child up.
-            self.cy_keys[j] = self.cy_keys[j_child]
-            self.cy_heap_index[self.cy_keys[j_child].i1, self.cy_keys[j_child].i2, self.cy_keys[j_child].i3] = j
+            idx_child = self.cy_keys[j_child]   # re-fetch in case j_child became j_right
+            self.cy_keys[j] = idx_child
+            self.cy_heap_index[idx_child.i1, idx_child.i2, idx_child.i3] = j
             j = j_child
             j_child = 2 * j + 1
         # The leaf at pos is empty now.  Put newitem there, and bubble it up
@@ -202,4 +202,4 @@ cdef class Heap(object):
         self.cy_keys[j] = idx_new
         self.cy_heap_index[idx_new.i1, idx_new.i2, idx_new.i3] = j
         self.sift_down(j_start, j)
-        return (True)
+        return True

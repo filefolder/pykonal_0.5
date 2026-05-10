@@ -14,6 +14,8 @@ cdef class EQLocator(object):
     cdef dict                    cy_arrivals
     cdef dict                    cy_traveltimes
     cdef dict                    cy_residual_rvs
+    cdef constants.REAL_t        cy_sigma_pick
+    cdef constants.REAL_t        cy_alpha
 
     cpdef constants.BOOL_t add_arrivals(EQLocator self, dict arrivals)
     cpdef constants.BOOL_t add_residual_rvs(EQLocator self, dict residua_rvs)
@@ -28,10 +30,12 @@ cdef class EQLocator(object):
         EQLocator self,
         constants.REAL_t[:] model
     )
-    #cpdef np.ndarray[constants.REAL_t, ndim=1] grid_search(EQLocator self)
+
     cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter)
     cpdef np.ndarray[constants.REAL_t, ndim=1] locate(
         EQLocator self,
         np.ndarray[constants.REAL_t, ndim=1] initial,
-        np.ndarray[constants.REAL_t, ndim=1] delta
+        np.ndarray[constants.REAL_t, ndim=1] delta,
+        constants.REAL_t sigma_pick=*,
+        constants.REAL_t alpha=*
     )
