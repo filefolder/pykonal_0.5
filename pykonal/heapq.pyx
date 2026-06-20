@@ -43,7 +43,7 @@ cdef class Heap(object):
         Array of indices indicating the heap position of each node. 
         Index -1 indicates that a node is not on the heap.
         """
-        return np.asarray(self.cy_heap_index, dtype=constants.DTYPE_INT)
+        return (np.asarray(self.cy_heap_index, dtype=constants.DTYPE_INT))
 
     @property
     def keys(self):
@@ -56,14 +56,16 @@ cdef class Heap(object):
         for i in range(self.cy_keys.size()):
             idx = self.cy_keys[i]
             output.append((idx.i1, idx.i2, idx.i3))
-        return output
+        return (output)
+
 
     @property
     def size(self):
         """
         [*Read only*, int] Number of node indices on the heap.
         """
-        return self.cy_keys.size()
+        return (self.cy_keys.size())
+
 
     @property
     def values(self):
@@ -87,8 +89,18 @@ cdef class Heap(object):
 
         :return: Index of node on the heap with smallest sort value.
         :rtype: tuple(int, int, int)
+        :raises IndexError: If the heap is empty.
         """
         cdef Index3D last, idx_return
+
+        if self.cy_keys.size() == 0:
+            # std::vector::back()/pop_back() on an empty vector is
+            # undefined behavior (no bounds check in C++). The solver's
+            # FMM loop already guards calls to pop() with a `while
+            # trial.cy_keys.size() > 0` check, but Heap is a general
+            # purpose class -- raise a clear, catchable error here rather
+            # than relying on every caller to externally guard this.
+            raise IndexError("pop() called on an empty Heap.")
 
         last = self.cy_keys.back()
         self.cy_keys.pop_back()
@@ -100,7 +112,7 @@ cdef class Heap(object):
             self.cy_heap_index[last.i1, last.i2, last.i3] = 0
             self.sift_up(0)
             return ((idx_return.i1, idx_return.i2, idx_return.i3))
-        return (last.i1, last.i2, last.i3)
+        return ((last.i1, last.i2, last.i3))
 
     cpdef constants.BOOL_t push(Heap self, Py_ssize_t i1, Py_ssize_t i2, Py_ssize_t i3):
         """
@@ -125,7 +137,8 @@ cdef class Heap(object):
         self.cy_keys.push_back(idx)
         self.cy_heap_index[idx.i1, idx.i2, idx.i3] = self.cy_keys.size()-1
         self.sift_down(0, self.cy_keys.size()-1)
-        return True
+        return (True)
+
 
     cpdef constants.BOOL_t sift_down(Heap self, Py_ssize_t j_start, Py_ssize_t j):
         """
@@ -160,7 +173,7 @@ cdef class Heap(object):
             break
         self.cy_keys[j] = idx_new
         self.cy_heap_index[idx_new.i1, idx_new.i2, idx_new.i3] = j
-        return True
+        return (True)
 
 
     cpdef constants.BOOL_t sift_up(Heap self, Py_ssize_t j_start):
@@ -177,6 +190,7 @@ cdef class Heap(object):
         """
         cdef Py_ssize_t j, j_child, j_end, j_right
         cdef Index3D idx_child, idx_right, idx_new
+        cdef bint    has_right
 
         j_end = self.cy_keys.size()
         j = j_start
@@ -186,15 +200,22 @@ cdef class Heap(object):
         while j_child < j_end:
             # Set childpos to index of smaller child.
             j_right = j_child + 1
+            has_right = j_right < j_end
             idx_child = self.cy_keys[j_child]
-            if j_right < j_end:
+            # Only read cy_keys[j_right] when it's actually in bounds.
+            # The original code indexed cy_keys[j_right] unconditionally
+            # before checking j_right < j_end; std::vector::operator[] does
+            # no bounds checking, so when j_right == j_end (the common case
+            # of a parent with only a left child) that was an out-of-bounds
+            # read -- undefined behavior in C++, on every pop() in the
+            # solver's hot loop.
+            if has_right:
                 idx_right = self.cy_keys[j_right]
                 if not self.cy_values[idx_child.i1, idx_child.i2, idx_child.i3] < self.cy_values[idx_right.i1, idx_right.i2, idx_right.i3]:
-                    j_child = j_right            
+                    j_child = j_right
             # Move the smaller child up.
-            idx_child = self.cy_keys[j_child]   # re-fetch in case j_child became j_right
-            self.cy_keys[j] = idx_child
-            self.cy_heap_index[idx_child.i1, idx_child.i2, idx_child.i3] = j
+            self.cy_keys[j] = self.cy_keys[j_child]
+            self.cy_heap_index[self.cy_keys[j_child].i1, self.cy_keys[j_child].i2, self.cy_keys[j_child].i3] = j
             j = j_child
             j_child = 2 * j + 1
         # The leaf at pos is empty now.  Put newitem there, and bubble it up
@@ -202,4 +223,4 @@ cdef class Heap(object):
         self.cy_keys[j] = idx_new
         self.cy_heap_index[idx_new.i1, idx_new.i2, idx_new.i3] = j
         self.sift_down(j_start, j)
-        return True
+        return (True)

@@ -46,8 +46,9 @@ class TraveltimeInventory(object):
         group.attrs["coord_sys"] = field.coord_sys
         group.attrs["field_type"] = field.field_type
 
-        for attr in ("min_coords", "node_intervals", "npts", "values"):
+        for attr in ("min_coords", "node_intervals", "npts"):
             group.create_dataset(attr, data=getattr(field, attr))
+        group.create_dataset("values",data=field.values.astype(np.float32)) # write the actual times only as float32
 
         return (True)
 

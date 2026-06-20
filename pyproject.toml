@@ -4,13 +4,13 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'pykonal'
-version = '0.5.1'
+version = '0.5.2'
 authors = [
-    {name='Malcolm C. A. White', email='malcolmw@mit.edu'}
+    {name='Malcolm C. A. White'}
 ]
 description = 'Solve the Eikonal equation in 3D Cartesian or spherical coordinates.'
 readme = 'README.md'
-requires-python = '>= 3.8'
+requires-python = '>= 3.11'
 classifiers = [
     'Development Status :: 4 - Beta',
     'Intended Audience :: Science/Research',

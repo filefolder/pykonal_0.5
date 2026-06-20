@@ -143,19 +143,24 @@ cdef class Field3D(object):
         [*Read only*, :class:`numpy.ndarray`\ (shape=(N0,N1,N2,3), dtype=numpy.float)]
         Array specifying the grid-node coordinates.
         """
-        nodes = [
-            np.linspace(
-                self.min_coords[idx],
-                self.max_coords[idx],
-                self.npts[idx],
-                dtype=constants.DTYPE_REAL
-            )
-            for idx in range(3)
-        ]
-        nodes = np.meshgrid(*nodes, indexing="ij")
-        nodes = np.stack(nodes)
-        nodes = np.moveaxis(nodes, 0, -1)
-        return (nodes)
+        # cy_nodes is declared as np.ndarray (an object type) in
+        # fields.pxd, so it defaults to None -- check against None rather
+        # than try/except AttributeError.
+        if self.cy_nodes is None:
+            nodes = [
+                np.linspace(
+                    self.min_coords[idx],
+                    self.max_coords[idx],
+                    self.npts[idx],
+                    dtype=constants.DTYPE_REAL
+                )
+                for idx in range(3)
+            ]
+            nodes = np.meshgrid(*nodes, indexing="ij")
+            nodes = np.stack(nodes)
+            nodes = np.moveaxis(nodes, 0, -1)
+            self.cy_nodes = nodes
+        return (self.cy_nodes)
 
     @property
     def norm(self):
@@ -199,8 +204,20 @@ cdef class Field3D(object):
         """
         [*Read only*, :class:`float`] Step size used for ray tracing.
         """
-        norm = self.norm[..., ~self.iax_isnull]
-        return (norm[~np.isclose(norm, 0)].min() / 4)
+        # cy_step_size is declared as a primitive constants.REAL_t (C
+        # double) in fields.pxd, not an object type -- primitive cdef
+        # attributes do NOT default to None/AttributeError the way typed
+        # object attributes do; an unset one simply holds whatever
+        # uninitialized memory it happens to contain. A try/except
+        # AttributeError check here would silently never trigger and could
+        # return garbage on first access, so an explicit boolean flag is
+        # used instead to track whether the value has actually been
+        # computed yet.
+        if not self.cy_step_size_isset:
+            norm = self.norm[..., ~self.iax_isnull]
+            self.cy_step_size = norm[~np.isclose(norm, 0)].min() / 4
+            self.cy_step_size_isset = True
+        return (self.cy_step_size)
 
 
     cdef constants.BOOL_t _update_iax_isperiodic(Field3D self):
@@ -266,7 +283,33 @@ cdef class Field3D(object):
         return (True)
 
 
-    cpdef constants.BOOL_t to_hdf(Field3D self, str path, str key=None, constants.BOOL_t overwrite=False):
+    cpdef constants.BOOL_t to_hdf(
+        Field3D self,
+        str path,
+        str key=None,
+        constants.BOOL_t overwrite=False,
+        constants.BOOL_t compress=True,
+        constants.BOOL_t low_precision=True
+    ):
+        """
+        to_hdf(self, path, key=None, overwrite=False, compress=True, low_precision=True)
+
+        Save the field to an HDF5 file.
+
+        :param compress: If True, write `values` with gzip compression.
+                         Field data (especially traveltime/velocity fields)
+                         tends to be spatially smooth and compresses well.
+        :type compress: bool
+        :param low_precision: If True, write `values` as float32 rather
+                              than float64. This halves storage for a
+                              negligible precision loss (~1e-7 relative),
+                              which is far below the physical precision of
+                              traveltime/velocity data. `min_coords`,
+                              `node_intervals`, and `npts` are always
+                              written at full precision since they are
+                              used for grid indexing.
+        :type low_precision: bool
+        """
 
         with h5py.File(path, mode="a") as f5:
 
@@ -284,12 +327,26 @@ cdef class Field3D(object):
             group.attrs["coord_sys"] = self.coord_sys
             group.attrs["field_type"] = self.field_type
 
-            for attr in ("min_coords", "node_intervals", "npts", "values"):
+            for attr in ("min_coords", "node_intervals", "npts"):
 
                 if attr in group and overwrite is True:
                     del (group[attr])
 
                 group.create_dataset(attr, data=getattr(self, attr))
+
+            if "values" in group and overwrite is True:
+                del (group["values"])
+
+            values = self.values
+            if low_precision:
+                values = values.astype(np.float32)
+
+            kwargs = {}
+            if compress:
+                kwargs["compression"] = "gzip"
+                kwargs["compression_opts"] = 4
+
+            group.create_dataset("values", data=values, **kwargs)
 
         return (True)
 
@@ -345,10 +402,16 @@ cdef class ScalarField3D(Field3D):
         [*Read only*, numpy.ndarray(shape=(N0,N1,N2,3), dtype=numpy.float)]
         Gradient of the field.
         """
-        if self.coord_sys == "cartesian":
-            return (self._gradient_of_cartesian())
-        elif self.coord_sys == "spherical":
-            return (self._gradient_of_spherical())
+        # cy_gradient is a typed cdef attribute (declared in fields.pxd),
+        # so it defaults to None rather than being unset/raising
+        # AttributeError -- check against None, matching the pattern used
+        # for cy_trial/cy_traveltime in solver.pyx.
+        if self.cy_gradient is None:
+            if self.coord_sys == "cartesian":
+                self.cy_gradient = self._gradient_of_cartesian()
+            elif self.coord_sys == "spherical":
+                self.cy_gradient = self._gradient_of_spherical()
+        return (self.cy_gradient)
 
     @property
     def values(self):
@@ -368,6 +431,13 @@ cdef class ScalarField3D(Field3D):
         if not np.all(values.shape == self.npts):
             raise (ValueError("Shape of values does not match npts attribute."))
         self.cy_values = values
+        # Invalidate caches that depend on field values. cy_gradient is a
+        # typed cdef attribute (VectorField3D), not a dict-backed Python
+        # attribute, so `del self.cy_gradient` is not supported by Cython
+        # ("Cannot delete C attribute of extension type") -- reset to None
+        # instead, which the gradient property already treats as "not yet
+        # computed".
+        self.cy_gradient = None
 
 
     cpdef np.ndarray[constants.REAL_t, ndim=1] resample(ScalarField3D self, constants.REAL_t[:,:] points, constants.REAL_t null=np.nan):
@@ -492,18 +562,30 @@ cdef class ScalarField3D(Field3D):
         cdef constants.REAL_t            f
         cdef Py_ssize_t[3][2]            ii
         cdef Py_ssize_t                  i1, i2, i3, iax, di1, di2, di3
+        cdef constants.REAL_t            pt_iax
+        cdef constants.REAL_t            span
 
         for iax in range(3):
-            if (
-                (
-                    point[iax] < self.cy_min_coords[iax]
-                    or point[iax] > self.cy_max_coords[iax]
+
+            pt_iax = point[iax]
+
+            if self.cy_iax_isperiodic[iax]:
+                # Wrap the coordinate into [min_coords, max_coords) before
+                # computing idx/delta below, so points passed in slightly
+                # outside the nominal range (e.g. phi = -1e-9, or
+                # phi = 2*pi + 0.1) are handled correctly instead of being
+                # spuriously rejected or mis-interpolated at the seam.
+                span = self.cy_max_coords[iax] + self.cy_node_intervals[iax] - self.cy_min_coords[iax]
+                pt_iax = self.cy_min_coords[iax] + (
+                    (pt_iax - self.cy_min_coords[iax]) % span
                 )
-                and not self.cy_iax_isperiodic[iax]
+            elif (
+                (pt_iax < self.cy_min_coords[iax] or pt_iax > self.cy_max_coords[iax])
                 and not self.cy_iax_isnull[iax]
             ):
                 return (null)
-            idx[iax]   = (point[iax] - self.cy_min_coords[iax]) / self.cy_node_intervals[iax]
+
+            idx[iax]   = (pt_iax - self.cy_min_coords[iax]) / self.cy_node_intervals[iax]
             if self.cy_iax_isnull[iax]:
                 ii[iax][0] = 0
                 ii[iax][1] = 0
@@ -515,6 +597,11 @@ cdef class ScalarField3D(Field3D):
                 if ii[iax][0] < 0 or ii[iax][0] >= self.npts[iax] or ii[iax][1] < 0 or ii[iax][1] >= self.npts[iax]:
                     return null
 
+            # idx[iax] % 1 here uses C fmod semantics (sign follows the
+            # dividend), but idx[iax] is guaranteed non-negative at this
+            # point: non-periodic out-of-range values already returned
+            # above, and periodic values were wrapped into
+            # [min_coords, max_coords) so (pt_iax - min_coords) >= 0.
             delta[iax] = idx[iax] % 1
 
         f000    = self.cy_values[ii[0][0], ii[1][0], ii[2][0]]
@@ -570,6 +657,21 @@ cdef class ScalarField3D(Field3D):
         grid       = self.nodes
         d0, d1, d2 = self.node_intervals
         n0, n1, n2 = self.npts
+
+        # The forward/backward second-order edge-difference formulas below
+        # index up to 3 nodes in from each edge (e.g. self.values[2] and
+        # self.values[-3]). For npts < 3 along a non-null axis those
+        # indices either don't exist or alias onto each other, silently
+        # producing a wrong gradient rather than a clear error -- so we
+        # check explicitly up front instead.
+        for iax, n in enumerate((n0, n1, n2)):
+            if not self.iax_isnull[iax] and n < 3:
+                raise ValueError(
+                    f"Cannot compute spherical gradient along axis {iax}: "
+                    f"npts={n} but at least 3 points are required for the "
+                    f"finite-difference stencil used here (or the axis "
+                    f"must be null, i.e. npts=1)."
+                )
 
         if not self.iax_isnull[0]:
             # Second-order forward difference evaluated along the lower edge
@@ -684,15 +786,18 @@ cdef class VectorField3D(Field3D):
         self.cy_values = np.asarray(value)
 
 
-    cpdef np.ndarray[constants.REAL_t, ndim=1] value(VectorField3D self, constants.REAL_t[:] point):
+    cpdef np.ndarray[constants.REAL_t, ndim=1] value(VectorField3D self, constants.REAL_t[:] point, constants.REAL_t null=np.nan):
         """
-        value(self, point)
+        value(self, point, null=numpy.nan)
 
         Interpolate the field at *point* using trilinear interpolation.
 
         :param point: Coordinates of the point at which to interpolate
                       the field.
         :type point: numpy.ndarray(shape=(3,), dtype=numpy.float)
+        :param null: Default (null) value to return (for every component)
+                     if point lies outside the interpolation domain.
+        :type null: float
         :return: Value of the field at *point*.
         :rtype: numpy.ndarray(shape=(3,), dtype=numpy.float)
         """
@@ -704,28 +809,49 @@ cdef class VectorField3D(Field3D):
         cdef constants.REAL_t            f
         cdef Py_ssize_t[3][2]            ii
         cdef Py_ssize_t                  i1, i2, i3, iax, di1, di2, di3
+        cdef constants.REAL_t            pt_iax
+        cdef constants.REAL_t            span
 
         for iax in range(3):
-            #if (
-            #    (
-            #        point[iax] < self.min_coords[iax]
-            #        or point[iax] > self.max_coords[iax]
-            #    )
-            #    and not self.is_periodic[iax]
-            #    and not self._iax_isnull[iax]
-            #):
-            #    raise(
-            #        OutOfBoundsError(
-            #            f"Point outside of interpolation domain requested: ({point[0]}, {point[1]}, {point[2]})"
-            #        )
-            #    )
-            idx[iax]   = (point[iax] - self.min_coords[iax]) / self.node_intervals[iax]
+
+            pt_iax = point[iax]
+
+            if self.iax_isperiodic[iax]:
+                # See ScalarField3D.value() for rationale -- wrap periodic
+                # (phi) coordinates into [min_coords, max_coords) instead
+                # of rejecting/mis-binning points just outside the nominal
+                # range due to floating point error or caller convention.
+                span = self.max_coords[iax] + self.node_intervals[iax] - self.min_coords[iax]
+                pt_iax = self.min_coords[iax] + (
+                    (pt_iax - self.min_coords[iax]) % span
+                )
+            elif (
+                (pt_iax < self.min_coords[iax] or pt_iax > self.max_coords[iax])
+                and not self.iax_isnull[iax]
+            ):
+                # Restored bounds check (was previously commented out
+                # entirely). Without this, out-of-range points fall through
+                # to raw array indexing below with no guarantee the
+                # resulting indices are in bounds -- in the worst case this
+                # reads outside the underlying buffer. Now returns `null`
+                # for every component, consistent with ScalarField3D.value().
+                ff[0] = null
+                ff[1] = null
+                ff[2] = null
+                return np.asarray(ff)
+
+            idx[iax]   = (pt_iax - self.min_coords[iax]) / self.node_intervals[iax]
             if self.iax_isnull[iax]:
                 ii[iax][0] = 0
                 ii[iax][1] = 0
             else:
                 ii[iax][0]  = <Py_ssize_t>idx[iax]
                 ii[iax][1]  = <Py_ssize_t>(ii[iax][0]+1) % self.npts[iax]
+                if ii[iax][0] < 0 or ii[iax][0] >= self.npts[iax] or ii[iax][1] < 0 or ii[iax][1] >= self.npts[iax]:
+                    ff[0] = null
+                    ff[1] = null
+                    ff[2] = null
+                    return np.asarray(ff)
             delta[iax] = idx[iax] % 1
 
         for iax in range(3):
@@ -844,6 +970,6 @@ def read_hdf(path, min_coords=None, max_coords=None):
         field.node_intervals = _node_intervals
         field.npts = idx_end - idx_start
         idxs = tuple(slice(idx_start[idx], idx_end[idx]) for idx in range(3))
-        field.values = f5["values"][idxs]
+        field.values = f5["values"][idxs].astype(constants.DTYPE_REAL)
 
     return field

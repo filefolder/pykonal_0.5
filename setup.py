@@ -14,7 +14,7 @@ name            = "pykonal"
 description     = "Solve the Eikonal equation in 3D Cartesian or spherical coordinates."
 url             = "https://github.com/malcolmw/pykonal"
 email           = "malcolmw@mit.edu"
-author          = "Malcolm C. A. White"
+author          = "Malcolm C. A. White (<0.5)"
 requires_python = ">=3.11"
 packages        = ["pykonal"]
 package_data    = {

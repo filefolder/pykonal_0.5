@@ -41,12 +41,14 @@ cdef class EQLocator(object):
         self.cy_sigma_pick    = 0.02
         self.cy_alpha         = 0.01
 
+        self.cy_traveltime_inventory = None
         inventory = _inventory.TraveltimeInventory(traveltime_inventory, mode="r")
         self.cy_traveltime_inventory = inventory
 
 
     def __del__(self):
-        self.traveltime_inventory.f5.close()
+        if self.cy_traveltime_inventory is not None:
+            self.traveltime_inventory.f5.close()
 
 
     def __enter__(self):

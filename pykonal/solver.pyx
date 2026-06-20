@@ -547,7 +547,6 @@ class PointSourceSolver(EikonalSolver):
         self.near_field.vv.npts = self.nrho, self.ntheta, self.nphi
         return True
 
-
     def initialize_near_field_narrow_band(self) -> bool:
         """
         Initialize the narrow band of the near-field grid using the
@@ -575,7 +574,7 @@ class PointSourceSolver(EikonalSolver):
                 self.near_field.tt.values[idx] = self.drho / vv
                 self.near_field.unknown[idx] = False
                 self.near_field.trial.push(*idx)
-
+        return True
 
     def initialize_far_field_narrow_band(self) -> bool:
         """
@@ -590,7 +589,7 @@ class PointSourceSolver(EikonalSolver):
             idx = tuple(idx)
             self.unknown[idx] = False
             self.trial.push(*idx)
-
+        return True
 
     def interpolate_near_field_traveltime_onto_far_field(self) -> bool:
         """
@@ -620,8 +619,8 @@ class PointSourceSolver(EikonalSolver):
         # Make sure to filter out any NaN values.
         tt = self.near_field.tt.resample(nodes[idxs].reshape(-1, 3))
         idxs = np.swapaxes(np.stack(idxs), 0, 1)[~np.isnan(tt)]
-        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)] #### hmmm
-
+        self.tt.values[(idxs[:,0], idxs[:,1], idxs[:,2])] = tt[~np.isnan(tt)]
+        return True
 
     def interpolate_far_field_velocity_onto_near_field(self) -> bool:
         """
@@ -665,7 +664,6 @@ class PointSourceSolver(EikonalSolver):
         self.near_field.vv.values[idxs] = self.vv.resample(nodes[idxs].reshape(-1, 3))
         return True
 
-
     def solve(self, max_traveltime=np.inf):
         """
         Solve the Eikonal equation on the far-field grid using the
@@ -682,8 +680,7 @@ class PointSourceSolver(EikonalSolver):
         self.initialize_near_field_narrow_band()
         # Propagate the wavefront through the near field.
         self.near_field.solve()
-        # Interpolate the near-field traveltime values onto the far-field
-        # grid.
+        # Interpolate the near-field traveltime values onto the far-field grid.
         self.interpolate_near_field_traveltime_onto_far_field()
         # Initialize the narrow band of the far-field grid.
         self.initialize_far_field_narrow_band()

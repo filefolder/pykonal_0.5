@@ -14,6 +14,11 @@ cdef class Field3D(object):
     cdef constants.UINT_t[3]       cy_npts
     cdef constants.REAL_t[3]       cy_node_intervals
 
+    cdef np.ndarray                cy_nodes
+    cdef VectorField3D             cy_gradient
+    cdef constants.REAL_t          cy_step_size
+    cdef constants.BOOL_t          cy_step_size_isset
+
     cdef constants.BOOL_t _update_max_coords(Field3D self)
     cdef constants.BOOL_t _update_iax_isnull(Field3D self)
     cdef constants.BOOL_t _update_iax_isperiodic(Field3D self)
@@ -22,7 +27,9 @@ cdef class Field3D(object):
         Field3D self,
         str path,
         str key=*,
-        constants.BOOL_t overwrite=*
+        constants.BOOL_t overwrite=*,
+        constants.BOOL_t compress=*,
+        constants.BOOL_t low_precision=*
     )
 
 
@@ -52,7 +59,8 @@ cdef class VectorField3D(Field3D):
 
     cpdef np.ndarray[constants.REAL_t, ndim=1] value(
         VectorField3D self,
-        constants.REAL_t[:] point
+        constants.REAL_t[:] point,
+        constants.REAL_t null=*
     )
 
 
