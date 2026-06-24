@@ -14,7 +14,6 @@ cdef class EQLocator(object):
     cdef dict                    cy_arrivals
     cdef dict                    cy_traveltimes
     cdef dict                    cy_residual_rvs
-    cdef constants.REAL_t        cy_sigma_pick
     cdef constants.REAL_t        cy_alpha
 
     cpdef constants.BOOL_t add_arrivals(EQLocator self, dict arrivals)
@@ -36,6 +35,5 @@ cdef class EQLocator(object):
         EQLocator self,
         np.ndarray[constants.REAL_t, ndim=1] initial,
         np.ndarray[constants.REAL_t, ndim=1] delta,
-        constants.REAL_t sigma_pick=*,
         constants.REAL_t alpha=*
     )

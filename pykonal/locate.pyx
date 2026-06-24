@@ -37,8 +37,7 @@ cdef class EQLocator(object):
         self.cy_traveltimes = {}
         self.cy_residual_rvs = {}
         self.cy_coord_sys = coord_sys
-        # new for adding uncertainty
-        self.cy_sigma_pick    = 0.02
+        # new for down-weighting distant traveltimes
         self.cy_alpha         = 0.01
 
         self.cy_traveltime_inventory = None
@@ -168,16 +167,6 @@ cdef class EQLocator(object):
         self.swave_velocity = value
 
     @property
-    def sigma_pick(self):
-        return self.cy_sigma_pick
-
-    @sigma_pick.setter
-    def sigma_pick(self, value):
-        if value < 0:
-            raise ValueError("sigma_pick must be >= 0")
-        self.cy_sigma_pick = value
-
-    @property
     def alpha(self):
         return self.cy_alpha
 
@@ -232,8 +221,8 @@ cdef class EQLocator(object):
 
         return sqrt(csum / valid_measurements)
     """
-
-    # weighted RMS (new)
+    """
+    # weighted RMS (newer)
     cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):
         cdef tuple key
         cdef dict arrivals = self.cy_arrivals
@@ -246,7 +235,6 @@ cdef class EQLocator(object):
         cdef constants.REAL_t weight
         cdef constants.REAL_t t0 = hypocenter[3]
         cdef constants.REAL_t[:] hypo_xyz = hypocenter[:3]
-        cdef constants.REAL_t sigma_pick_sq = self.cy_sigma_pick * self.cy_sigma_pick
         cdef constants.REAL_t alpha_sq = self.cy_alpha * self.cy_alpha
         cdef int valid_measurements = 0
 
@@ -255,7 +243,7 @@ cdef class EQLocator(object):
             if isinf(tt) or isnan(tt) or tt > 9999:
                 continue
             num = arrivals[key] - t0 - tt
-            variance = sigma_pick_sq + alpha_sq * tt * tt
+            variance = alpha_sq * tt * tt
             weight = 1.0 / variance
             csum += weight * num * num
             weight_sum += weight
@@ -265,22 +253,45 @@ cdef class EQLocator(object):
             return 1e6
 
         return sqrt(csum / weight_sum)
+    """
+
+    # L1 weighting, hopefully more immune to garbage
+    cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):
+        cdef constants.REAL_t t0 = hypocenter[3]
+        cdef constants.REAL_t[:] hypo_xyz = hypocenter[:3]
+        cdef constants.REAL_t alpha_sq = self.cy_alpha * self.cy_alpha
+        cdef constants.REAL_t tt, num, weight
+        cdef int valid_measurements = 0
+        cdef constants.REAL_t csum = 0
+        cdef constants.REAL_t weight_sum = 0
+
+        for key in self.cy_arrivals:
+            tt = self.cy_traveltimes[key].value(hypo_xyz, null=INFINITY)
+            if isinf(tt) or isnan(tt) or tt > 9999:
+                continue
+            num = self.cy_arrivals[key] - t0 - tt
+            weight = 1.0 / (1.0 + alpha_sq * tt * tt)
+            csum += weight * (num if num >= 0 else -num)
+            weight_sum += weight
+            valid_measurements += 1
+
+        if valid_measurements == 0:
+            return 1e6
+
+        return csum / weight_sum
 
 
     cpdef np.ndarray[constants.REAL_t, ndim=1] locate(
         EQLocator self,
         np.ndarray[constants.REAL_t, ndim=1] initial,
         np.ndarray[constants.REAL_t, ndim=1] delta,
-        constants.REAL_t sigma_pick=0.02, 
         constants.REAL_t alpha=0.01        
     ):
         """
         Locate event using a grid search and Differential Evolution
         Optimization to minimize the residual RMS.
-        sigma_pick (seconds) picking precision floor
         alpha = fractional traveltime error in % 
         """
-        self.cy_sigma_pick = sigma_pick
         self.cy_alpha = alpha
       
         min_coords = initial - delta
