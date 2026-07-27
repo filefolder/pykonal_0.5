@@ -15,6 +15,18 @@ cdef class EQLocator(object):
     cdef dict                    cy_traveltimes
     cdef dict                    cy_residual_rvs
     cdef constants.REAL_t        cy_alpha
+    # NLL-style additions
+    cdef dict                    cy_pick_errors
+    cdef constants.REAL_t        cy_default_pick_error
+    cdef constants.REAL_t        cy_edt_exponent
+    cdef constants.REAL_t        cy_edt_reg
+    cdef object                  cy_locate_seed
+    # flattened per-arrival workspace (rebuilt by _prepare_workspace)
+    cdef list                    cy_keys
+    cdef list                    cy_tt_fields
+    cdef constants.REAL_t[:]     cy_obs
+    cdef constants.REAL_t[:]     cy_sigma
+    cdef constants.REAL_t[:]     cy_tt_work
 
     cpdef constants.BOOL_t add_arrivals(EQLocator self, dict arrivals)
     cpdef constants.BOOL_t add_residual_rvs(EQLocator self, dict residua_rvs)
@@ -31,9 +43,20 @@ cdef class EQLocator(object):
     )
 
     cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter)
-    cpdef np.ndarray[constants.REAL_t, ndim=1] locate(
+    cpdef constants.BOOL_t add_stations(EQLocator self, dict stations)
+    cpdef constants.BOOL_t add_pick_errors(EQLocator self, dict pick_errors)
+    cpdef constants.BOOL_t _prepare_workspace(EQLocator self)
+    cdef int _fill_traveltimes(EQLocator self, constants.REAL_t[:] hypo_xyz)
+    cpdef constants.REAL_t edt_log_likelihood(
         EQLocator self,
-        np.ndarray[constants.REAL_t, ndim=1] initial,
-        np.ndarray[constants.REAL_t, ndim=1] delta,
-        constants.REAL_t alpha=*
+        constants.REAL_t[:] hypo_xyz
+    )
+    cpdef constants.REAL_t edt(EQLocator self, constants.REAL_t[:] hypo_xyz)
+    cpdef constants.REAL_t origin_time(EQLocator self, constants.REAL_t[:] hypo_xyz)
+    cpdef np.ndarray locate(
+        EQLocator self,
+        np.ndarray initial,
+        np.ndarray delta,
+        constants.REAL_t alpha=*,
+        str method=*
     )

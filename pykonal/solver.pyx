@@ -27,7 +27,7 @@ from . import constants
 
 # Cython built-in imports.
 cimport cython
-from libc.math cimport sqrt, sin
+from libc.math cimport sqrt, sin, INFINITY
 from libcpp.vector cimport vector as cpp_vector
 from libc.stdlib   cimport malloc, free
 
@@ -199,7 +199,9 @@ cdef class EikonalSolver(object):
         """
         return self.velocity
 
-    @cython.boundscheck(True)
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.cdivision(True)
     @cython.initializedcheck(False)
     cpdef constants.BOOL_t solve(EikonalSolver self, constants.REAL_t max_traveltime=np.inf):
         """
@@ -223,7 +225,9 @@ cdef class EikonalSolver(object):
         cdef int[2]                               order
         cdef constants.REAL_t                     a, b, c, bfd, ffd, new
         cdef constants.REAL_t[2]                  fdu
-        cdef constants.REAL_t[3]                  aa, bb, cc
+        cdef constants.REAL_t[3]                  aa, bb, cc, op_tt
+        cdef Py_ssize_t                           drop_iax
+        cdef constants.REAL_t                     max_op
         cdef constants.REAL_t[:,:,:]              tt, vv
         cdef constants.REAL_t[:,:,:,:]            norm
         cdef constants.BOOL_t[3]                  iax_isperiodic,
@@ -287,6 +291,7 @@ cdef class EikonalSolver(object):
                         norm_iax = norm[nbr[0], nbr[1], nbr[2], iax]
                         if norm_iax == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
+                            op_tt[iax] = -1.0  # axis inactive
                             continue
                         switch = [0, 0, 0]
                         idrxn = 0
@@ -370,27 +375,57 @@ cdef class EikonalSolver(object):
                             aa[iax] = 9.0 / denom_iax
                             bb[iax] = (6.0 * tt2 - 24.0 * tt1) / denom_iax
                             cc[iax] = (tt2*tt2 - 8.0*tt2*tt1 + 16.0*tt1*tt1) / denom_iax
+                            op_tt[iax] = tt1
                         elif order[idrxn] == 1:
                             tt1 = tt[nbr1_i1, nbr1_i2, nbr1_i3]
                             aa[iax] = 1.0 / norm_iax_sq
                             bb[iax] = -2.0 * tt1 / norm_iax_sq
                             cc[iax] = tt1 * tt1 / norm_iax_sq
+                            op_tt[iax] = tt1
                         elif order[idrxn] == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
-                    a = aa[0] + aa[1] + aa[2]
-                    if a < 1e-20:
-                    #    count_a += 1 // no longer tracking
+                            op_tt[iax] = -1.0  # axis inactive
+                    # Solve the multi-axis quadratic with the standard
+                    # dimension-reduction repair: a negative discriminant,
+                    # or a root smaller than an operand traveltime, means
+                    # the characteristic cannot pass through the quadrant
+                    # spanned by the active axes (this happens most often
+                    # with large node-interval ratios between axes, e.g.
+                    # near the poles of the near-field spherical grid).
+                    # Instead of zeroing the discriminant, drop the axis
+                    # with the largest operand traveltime and re-solve
+                    # with the remaining axes.
+                    new = INFINITY
+                    while True:
+                        a = aa[0] + aa[1] + aa[2]
+                        if a < 1e-20:
+                            break
+                        b = bb[0] + bb[1] + bb[2]
+                        c = cc[0] + cc[1] + cc[2] - 1.0/(v_nbr*v_nbr)
+                        if b*b >= 4*a*c:
+                            new = (-b + sqrt(b*b - 4*a*c)) / (2*a)
+                            # Causality check: the root must not undercut
+                            # any operand traveltime still in the update.
+                            if (
+                                    new >= op_tt[0]
+                                and new >= op_tt[1]
+                                and new >= op_tt[2]
+                            ):
+                                break
+                            new = INFINITY
+                        # Drop the active axis with the largest operand.
+                        drop_iax, max_op = 0, -1.0
+                        for iax in range(3):
+                            if op_tt[iax] > max_op:
+                                drop_iax, max_op = iax, op_tt[iax]
+                        if max_op < 0:
+                            break
+                        aa[drop_iax] = 0
+                        bb[drop_iax] = 0
+                        cc[drop_iax] = 0
+                        op_tt[drop_iax] = -1.0
+                    if new == INFINITY:
                         continue
-                    b = bb[0] + bb[1] + bb[2]
-                    c = cc[0] + cc[1] + cc[2] - 1.0/(v_nbr*v_nbr)
-                    if b*b < 4*a*c:
-                        # This is a hack to solve the quadratic equation
-                        # when the discrimnant is negative. This hack
-                        # simply sets the discriminant to zero.
-                        new = -b/(2*a)
-                        #count_b += 1 // no longer tracking
-                    else:
-                        new = (-b + sqrt(b*b - 4*a*c)) / (2*a)
                     if new < tt_nbr:
                         tt[nbr[0], nbr[1], nbr[2]] = new
                         # Tag as Trial all neighbours of Active that are not
