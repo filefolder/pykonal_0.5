@@ -553,7 +553,7 @@ def write_output(origin):
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="r+") as f:
         path = f.name
     ar = seiscomp.io.XMLArchive()
-    ar.setFormattedOutput(True)
+    ar.setFormattedOutput(False) # unformat the output to reduce size in the stdout pipe
     if not ar.create(path):
         raise RuntimeError("Could not create output XML")
     ar.writeObject(origin)   # Origin directly, NOT wrapped in EventParameters
