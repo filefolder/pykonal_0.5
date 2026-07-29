@@ -1153,30 +1153,45 @@ def main():
     origin.setCreationInfo(ci)
 
     # arrivals with residuals
+    #
+    # scolv reads Arrival.distance() unguarded (OriginLocatorView), so an
+    # arrival added without it aborts the GUI with Core::ValueException.
+    # Any station we cannot place geometrically is therefore dropped from
+    # the output origin entirely, and announced below.
     used = 0
+    dropped = []
     for key, pid in pick_ids.items():
+        sta = stations.get(key[:2])
+        if sta is None or not (np.isfinite(sta[0]) and np.isfinite(sta[1])):
+            dropped.append(f"{key[0]}.{key[1]}.{key[2]}")
+            continue
+
         arr = seiscomp.datamodel.Arrival()
         arr.setPickID(pid)
         arr.setPhase(seiscomp.datamodel.Phase(key[2]))
+        dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
+        arr.setDistance(dist)  # degrees of arc
+        arr.setAzimuth(az)
         if key in residuals:
             arr.setTimeResidual(float(residuals[key]))
             arr.setWeight(arrival_weights.get(key, 1.0))
             arr.setTimeUsed(True)
             used += 1
         else:
+            arr.setTimeResidual(0.0)
             arr.setWeight(0.0)
             arr.setTimeUsed(False)
-        sta = stations.get(key[:2])
-        if sta is not None:
-            dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
-            arr.setDistance(dist)  # degrees of arc
-            arr.setAzimuth(az)
         origin.add(arr)
+
+    if dropped:
+        log(f"dropped {len(dropped)} arrival(s) from the output origin — "
+            f"no usable station coordinates: {', '.join(sorted(dropped))} "
+            f"(add them to stations_csv)")
 
     # quality
     q = seiscomp.datamodel.OriginQuality()
     q.setUsedPhaseCount(used)
-    q.setAssociatedPhaseCount(len(pick_ids))
+    q.setAssociatedPhaseCount(origin.arrivalCount())
     if np.isfinite(quality["rms"]):
         q.setStandardError(float(quality["rms"]))
     if np.isfinite(quality["azimuthal_gap"]):
