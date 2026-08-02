@@ -724,6 +724,34 @@ def main():
             (key, a["pick_id"], a["time"], a["time_uncertainty"], a["weight"])
         )
 
+    # Distance census (always on): make it explicit how far each arrival's
+    # station is and flag any beyond max_dist_km. Beyond that limit no
+    # traveltime grid is built, so the arrival is dropped later with no
+    # obvious reason; logging it here removes the mystery.
+    _maxd = float(cfg.get("max_dist_km", 900.0))
+    if stations:
+        _too_far = []
+        _dists = []
+        for key, pid, t, terr, wt in pick_list:
+            sta = stations.get(key[:2])
+            if sta is None:
+                _dists.append((key, None))
+                continue
+            d_deg, _ = gc_distance_azimuth(lat0, lon0, sta[0], sta[1])
+            d_km = d_deg * 111.195
+            _dists.append((key, d_km))
+            if d_km > _maxd:
+                _too_far.append((key, d_km))
+        _no_coord = [k for k, d in _dists if d is None]
+        if _too_far:
+            log(f"{len(_too_far)} arrival(s) beyond max_dist_km={_maxd:.0f} km "
+                f"(no traveltime grid -> will be excluded): "
+                + ", ".join(f"{'.'.join(k)}@{d:.0f}km" for k, d in _too_far))
+        if _no_coord:
+            log(f"{len(_no_coord)} arrival(s) with no station coordinates in "
+                f"stations_csv (distance unknown): "
+                + ", ".join('.'.join(k) for k in _no_coord))
+
     if len(pick_list) < 4:
         raise RuntimeError(f"Only {len(pick_list)} usable picks; need >= 4")
 
@@ -747,9 +775,12 @@ def main():
     pick_errors = {}
     pick_ids = {}
     arrival_weights = {}   # scolv weight per key, echoed back on output
+    _n_dup = 0
     for key, pid, t, terr, wt in pick_list:
         if key in arrivals:
-            log(f"duplicate arrival for {key}; keeping first")
+            _n_dup += 1
+            log(f"duplicate arrival for {'.'.join(key)}; keeping first "
+                f"(same network/station/phase key)")
             continue
         arrivals[key] = (t - epoch).length()  # TimeSpan -> seconds
         # Pick uncertainty comes from the pick's own time uncertainty, or
@@ -765,6 +796,16 @@ def main():
         pick_errors[key] = float(terr) if terr else default_pick_error
         pick_ids[key] = pid
         arrival_weights[key] = float(wt) if wt else 1.0
+
+    # Reconcile the counts so it is never a mystery where arrivals went
+    # between input and location: input -> (weight-0 excluded) -> distance
+    # census -> (duplicate-key collapsed) -> unique keys located. Any
+    # further reduction below is the off-grid filter and outlier rejection,
+    # which log separately.
+    _n_zero = sum(1 for a in arrivals_in if a["weight"] == 0.0)
+    log(f"arrival census: {len(arrivals_in)} input, "
+        f"{_n_zero} weight-0 excluded, {_n_dup} duplicate-key collapsed, "
+        f"{len(arrivals)} unique station-phase keys to locate")
 
     # ---------------- run the locator
     # Optional physical clamp on the depth search box. Off by default:
@@ -1169,8 +1210,21 @@ def main():
     origin.setCreationInfo(ci)
 
     # arrivals with residuals
+    #
+    # SeisComP validates Arrival.distance on serialization: an Arrival with
+    # no distance set throws "Arrival.distance is not set" and aborts the
+    # whole output. That happens for any station missing from stations_csv
+    # (no coordinates -> no distance). Such arrivals were already excluded
+    # from the LOCATION, so we simply do not emit an Arrival for them here;
+    # emitting a distance-less one would crash the plugin. Logged so the
+    # dropped station is visible.
     used = 0
+    _no_dist = []
     for key, pid in pick_ids.items():
+        sta = stations.get(key[:2])
+        if sta is None:
+            _no_dist.append(key)
+            continue  # cannot set distance -> would crash serialization
         arr = seiscomp.datamodel.Arrival()
         arr.setPickID(pid)
         arr.setPhase(seiscomp.datamodel.Phase(key[2]))
@@ -1182,12 +1236,14 @@ def main():
         else:
             arr.setWeight(0.0)
             arr.setTimeUsed(False)
-        sta = stations.get(key[:2])
-        if sta is not None:
-            dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
-            arr.setDistance(dist)  # degrees of arc
-            arr.setAzimuth(az)
+        dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
+        arr.setDistance(dist)  # degrees of arc
+        arr.setAzimuth(az)
         origin.add(arr)
+    if _no_dist:
+        log(f"{len(_no_dist)} arrival(s) omitted from output (no station "
+            f"coordinates, cannot set Arrival.distance): "
+            + ", ".join('.'.join(k) for k in _no_dist))
 
     # quality
     q = seiscomp.datamodel.OriginQuality()
