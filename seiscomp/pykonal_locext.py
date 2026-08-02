@@ -356,7 +356,7 @@ def _rebuild_master(dirpath):
 
 
 def ensure_traveltimes_sharded(dirpath, requests, velocity_models,
-                               max_dist=None, nproc=None):
+                               max_dist=900.0, nproc=None):
     """
     Plugin-side alternative to pykonal's ensure_traveltimes that stores one
     HDF5 file per station-phase instead of one large shared file.
@@ -443,6 +443,16 @@ def read_input():
     keepalive : the EventParameters object (hold a reference until done).
     """
     data = sys.stdin.buffer.read()
+    return read_input_from_bytes(data)
+
+
+def read_input_from_bytes(data):
+    """
+    Same as read_input() but parses EventParameters from an in-memory
+    bytes object instead of stdin. Used by the batch driver so many events
+    can be relocated in one process. See read_input for the segfault note
+    on keeping the parent EventParameters alive.
+    """
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as f:
         f.write(data)
         path = f.name
@@ -550,33 +560,34 @@ def write_output(origin):
     main), so nothing any library printed to stdout can corrupt the
     single XML document the plugin reads from our stdout.
     """
+    xml_bytes = origin_to_bytes(origin)
+    _REAL_STDOUT.buffer.write(xml_bytes)
+    _REAL_STDOUT.flush()
+
+
+def origin_to_bytes(origin):
+    """Serialize a bare <Origin> (not wrapped in EventParameters) to XML
+    bytes, with the same sanity checks write_output applied. Shared by the
+    plugin path and the batch driver."""
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="r+") as f:
         path = f.name
     ar = seiscomp.io.XMLArchive()
-    ar.setFormattedOutput(False) # unformat the output to reduce size in the stdout pipe
+    ar.setFormattedOutput(True)
     if not ar.create(path):
         raise RuntimeError("Could not create output XML")
     ar.writeObject(origin)   # Origin directly, NOT wrapped in EventParameters
     ar.close()
-
     with open(path, "rb") as f:
         xml_bytes = f.read()
-
-    # sanity checks before it ever reaches the C++ parent
     if not xml_bytes.lstrip().startswith(b"<?xml"):
-        raise RuntimeError(
-            "generated output does not begin with an XML declaration"
-        )
+        raise RuntimeError("generated output does not begin with an XML declaration")
     if b"<Origin" not in xml_bytes:
         raise RuntimeError("generated output contains no <Origin> element")
-
-    _REAL_STDOUT.buffer.write(xml_bytes)
-    _REAL_STDOUT.flush()
-
     try:
         os.unlink(path)
     except OSError:
         pass
+    return xml_bytes
 
 
 # --------------------------------------------------------------------------
@@ -588,8 +599,13 @@ def main():
     # to stderr (visible in scolv logs) and can never corrupt the single
     # XML document the locext plugin reads from our stdout.
     global _REAL_STDOUT
-    _REAL_STDOUT = os.fdopen(os.dup(1), "w")
-    os.dup2(2, 1)
+    # Redirect fd 1 -> fd 2 exactly once so stray library output can't
+    # corrupt the XML on stdout. Guarded so batch drivers that call main()
+    # in a loop don't re-dup on every event.
+    if not getattr(main, "_stdout_redirected", False):
+        _REAL_STDOUT = os.fdopen(os.dup(1), "w")
+        os.dup2(2, 1)
+        main._stdout_redirected = True
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -914,13 +930,13 @@ def main():
         if sharded:
             report = ensure_traveltimes_sharded(
                 shard_dir, requests, velocity_models,
-                max_dist=float(cfg.get("max_dist_km", None)),
+                max_dist=float(cfg.get("max_dist_km", 900.0)),
                 nproc=cfg.get("ensure_nproc"),
             )
         else:
             report = ensure_traveltimes(
                 inv_path, requests, velocity_models,
-                max_dist=float(cfg.get("max_dist_km", None)),
+                max_dist=float(cfg.get("max_dist_km", 900.0)),
                 nproc=cfg.get("ensure_nproc"),
             )
         if report["computed"]:
@@ -1153,45 +1169,30 @@ def main():
     origin.setCreationInfo(ci)
 
     # arrivals with residuals
-    #
-    # scolv reads Arrival.distance() unguarded (OriginLocatorView), so an
-    # arrival added without it aborts the GUI with Core::ValueException.
-    # Any station we cannot place geometrically is therefore dropped from
-    # the output origin entirely, and announced below.
     used = 0
-    dropped = []
     for key, pid in pick_ids.items():
-        sta = stations.get(key[:2])
-        if sta is None or not (np.isfinite(sta[0]) and np.isfinite(sta[1])):
-            dropped.append(f"{key[0]}.{key[1]}.{key[2]}")
-            continue
-
         arr = seiscomp.datamodel.Arrival()
         arr.setPickID(pid)
         arr.setPhase(seiscomp.datamodel.Phase(key[2]))
-        dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
-        arr.setDistance(dist)  # degrees of arc
-        arr.setAzimuth(az)
         if key in residuals:
             arr.setTimeResidual(float(residuals[key]))
             arr.setWeight(arrival_weights.get(key, 1.0))
             arr.setTimeUsed(True)
             used += 1
         else:
-            arr.setTimeResidual(0.0)
             arr.setWeight(0.0)
             arr.setTimeUsed(False)
+        sta = stations.get(key[:2])
+        if sta is not None:
+            dist, az = gc_distance_azimuth(lat, lon, sta[0], sta[1])
+            arr.setDistance(dist)  # degrees of arc
+            arr.setAzimuth(az)
         origin.add(arr)
-
-    if dropped:
-        log(f"dropped {len(dropped)} arrival(s) from the output origin — "
-            f"no usable station coordinates: {', '.join(sorted(dropped))} "
-            f"(add them to stations_csv)")
 
     # quality
     q = seiscomp.datamodel.OriginQuality()
     q.setUsedPhaseCount(used)
-    q.setAssociatedPhaseCount(origin.arrivalCount())
+    q.setAssociatedPhaseCount(len(pick_ids))
     if np.isfinite(quality["rms"]):
         q.setStandardError(float(quality["rms"]))
     if np.isfinite(quality["azimuthal_gap"]):
