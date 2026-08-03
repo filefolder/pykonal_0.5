@@ -707,7 +707,7 @@ def main():
             for a in arrivals_in
         )).encode()
     ).hexdigest()[:8]
-    log(f"input: initial=({lat0:.4f}, {lon0:.4f}, dep {dep0:.1f} km), "
+    log(f" > > > input: initial=({lat0:.4f}, {lon0:.4f}, dep {dep0:.1f} km), "
         f"{len(arrivals_in)} arrivals, fingerprint={_afp}, "
         f"ignore_initial={args.ignore_initial_location}, "
         f"fixed_depth={args.fixed_depth}")
@@ -1012,13 +1012,64 @@ def main():
         # edt_reg is the one optional EDT knob (opt-in; 0 = pure EDT).
         if hasattr(locator, "edt_reg") and "edt_reg" in cfg:
             locator.edt_reg = float(cfg["edt_reg"])
-        locator.add_arrivals(arrivals)
-        locator.add_pick_errors(pick_errors)
+        # Optionally solve using only the N geographically-closest arrivals,
+        # while still reporting residuals for ALL of them. Distant arrivals
+        # in a 1D model carry systematic Pn/model error that can drag the
+        # solution; restricting the SOLVE to nearby stations (which sample
+        # the crust the model actually represents) can give a cleaner
+        # hypocenter, and the far arrivals still get residuals for QC.
+        # Ranking is by epicentral distance from the initial origin, using
+        # station coordinates from stations_csv; arrivals without coords
+        # cannot be ranked and are always placed in the far (report-only)
+        # set. 0 or unset = use all arrivals to solve (original behavior).
+        _n_closest = int(cfg.get("solve_n_closest", 0))
+        _solve_arrivals = arrivals
+        _solve_pick_errors = pick_errors
+        if _n_closest > 0 and len(arrivals) > _n_closest:
+            _ranked = []
+            _unranked = []
+            for key in arrivals:
+                sta = stations.get(key[:2])
+                if sta is None:
+                    _unranked.append(key)
+                    continue
+                d_deg, _ = gc_distance_azimuth(lat0, lon0, sta[0], sta[1])
+                _ranked.append((d_deg, key))
+            _ranked.sort(key=lambda t: t[0])
+            _solve_keys = set(k for _, k in _ranked[:_n_closest])
+            _solve_arrivals = {k: v for k, v in arrivals.items()
+                               if k in _solve_keys}
+            _solve_pick_errors = {k: v for k, v in pick_errors.items()
+                                  if k in _solve_keys}
+            _far = len(arrivals) - len(_solve_arrivals)
+            log(f"solve_n_closest={_n_closest}: solving with the "
+                f"{len(_solve_arrivals)} closest arrival(s); {_far} farther "
+                f"arrival(s) kept for residual reporting only"
+                + (f" ({len(_unranked)} unrankable, no coords)"
+                   if _unranked else ""))
+
+        locator.add_arrivals(_solve_arrivals)
+        locator.add_pick_errors(_solve_pick_errors)
         if grid_stations:
             locator.add_stations(grid_stations)
 
         _t_compute = _time.time()
         soln = locator.locate(initial, delta, alpha, method)
+
+        # Residuals for ALL arrivals at the final hypocenter, not just the
+        # solve set: a residual is observed - predicted at the fixed
+        # solution and does not depend on which arrivals drove the fit, so
+        # we add the full set back before reading residuals.
+        if _solve_arrivals is not arrivals:
+            locator.clear_arrivals()
+            locator.add_arrivals(arrivals)
+            locator.add_pick_errors(pick_errors)
+            # residuals() needs the traveltime grids in memory; locate()
+            # only loaded the solve-set grids, so re-read for the full set
+            # (same search box) or the far arrivals come back with no
+            # residual and get nulled in the output.
+            locator.read_traveltimes(min_coords=(initial - delta)[:3],
+                                     max_coords=(initial + delta)[:3])
         residuals = locator.residuals(soln)
 
         # ------------------------------------------------ outlier rejection
@@ -1037,6 +1088,11 @@ def main():
         _cut_abs = float(cfg.get("outlier_cutoff_s", 3.0))
         _cut_mad = float(cfg.get("outlier_mad_factor", 4.0))
         _min_keep = max(int(cfg.get("outlier_min_arrivals", 6)), 4)
+        # The solve set for relocation is the (possibly restricted) set;
+        # residuals are always evaluated over ALL remaining arrivals. When
+        # solve_n_closest is active, outlier rejection still uses residuals
+        # from every arrival to decide what is bad, but relocates only on
+        # the closest set so the restriction is preserved across passes.
         _excluded = []
         if _cut_abs > 0 and len(arrivals) > _min_keep:
             for _pass in range(3):
@@ -1053,11 +1109,20 @@ def main():
                 for k in _bad:
                     arrivals.pop(k, None)
                     pick_errors.pop(k, None)
+                    _solve_arrivals.pop(k, None)
+                    _solve_pick_errors.pop(k, None)
                 _excluded.extend(_bad)
                 locator.clear_arrivals()
-                locator.add_arrivals(arrivals)
-                locator.add_pick_errors(pick_errors)
+                locator.add_arrivals(_solve_arrivals)
+                locator.add_pick_errors(_solve_pick_errors)
                 soln = locator.locate(initial, delta, alpha, method)
+                # residuals over ALL remaining arrivals at the new solution
+                if _solve_arrivals is not arrivals:
+                    locator.clear_arrivals()
+                    locator.add_arrivals(arrivals)
+                    locator.add_pick_errors(pick_errors)
+                    locator.read_traveltimes(min_coords=(initial - delta)[:3],
+                                             max_coords=(initial + delta)[:3])
                 residuals = locator.residuals(soln)
             if _excluded:
                 log(f"rejected {len(_excluded)} outlier arrival(s) "
@@ -1153,12 +1218,16 @@ def main():
     # model that is too fast (the usual cause of large positive residuals).
     if cfg.get("log_arrival_detail") and residuals:
         log("per-arrival detail (dist_km, tt_pred_s, apparent_km_s, resid_s):")
-        for key in sorted(residuals):
+        # compute distance for each arrival first so the table can be sorted
+        # closest-station-first; arrivals with no coordinates sort last.
+        _detail = []
+        for key in residuals:
             _sta = stations.get(key[:2])
             if _sta is None:
                 continue
             _ddeg, _ = gc_distance_azimuth(lat, lon, _sta[0], _sta[1])
-            _d = _ddeg * 111.195          # degrees of arc -> km
+            _detail.append((_ddeg * 111.195, key))
+        for _d, key in sorted(_detail, key=lambda t: t[0]):
             # predicted traveltime = observed_offset - t0_offset - residual
             _ttp = arrivals[key] - float(soln[3]) - residuals[key]
             _app = (_d / _ttp) if _ttp > 0.01 else float("nan")
