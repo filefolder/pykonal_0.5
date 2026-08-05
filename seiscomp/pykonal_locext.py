@@ -356,7 +356,7 @@ def _rebuild_master(dirpath):
 
 
 def ensure_traveltimes_sharded(dirpath, requests, velocity_models,
-                               max_dist=900.0, nproc=None):
+                               max_dist=1000.0, nproc=None):
     """
     Plugin-side alternative to pykonal's ensure_traveltimes that stores one
     HDF5 file per station-phase instead of one large shared file.
@@ -420,16 +420,6 @@ def read_input():
     """
     Read EventParameters from stdin and extract everything needed into
     plain Python objects.
-
-    IMPORTANT (segfault fix): the seiscomp Python bindings reference-count
-    child objects (origin, arrivals, picks) through their parent
-    EventParameters. If that parent is garbage-collected, the children
-    become dangling pointers and the next attribute access (e.g.
-    arrival.pickID()) segfaults. Earlier this function returned the
-    origin/picks while dropping the parent, so we now (a) read into
-    plain-Python structures here, while the parent is provably alive, and
-    (b) still return the parent so the caller keeps it alive as a belt-
-    and-braces measure.
 
     Returns
     -------
@@ -540,7 +530,7 @@ def read_input_from_bytes(data):
     return origin_info, arrivals, ep
 
 
-def write_output(origin):
+def write_output(origin, wrap_eventparameters=False):
     """
     Write the relocated origin to the REAL stdout as a SeisComP XML
     document containing the Origin DIRECTLY under <seiscomp>, i.e.
@@ -560,29 +550,43 @@ def write_output(origin):
     main), so nothing any library printed to stdout can corrupt the
     single XML document the plugin reads from our stdout.
     """
-    xml_bytes = origin_to_bytes(origin)
+    xml_bytes = origin_to_bytes(origin, wrap_eventparameters=wrap_eventparameters)
     _REAL_STDOUT.buffer.write(xml_bytes)
     _REAL_STDOUT.flush()
 
 
-def origin_to_bytes(origin):
-    """Serialize a bare <Origin> (not wrapped in EventParameters) to XML
-    bytes, with the same sanity checks write_output applied. Shared by the
-    plugin path and the batch driver."""
+def origin_to_bytes(origin, wrap_eventparameters=False):
+    """Serialize the relocated Origin to SeisComP XML bytes.
+
+    By default writes a BARE <Origin> directly under <seiscomp>, which is
+    what scolv's LocExt reader requires. With wrap_eventparameters=True the
+    Origin is placed inside an <EventParameters> element, producing a
+    self-contained document that scdispatch can merge/associate directly
+    (no separate wrapping step). The arrivals still reference existing pick
+    publicIDs; the picks themselves are not emitted, so the target database
+    must already hold them (true for relocation of an existing catalog)."""
+    if wrap_eventparameters:
+        ep = seiscomp.datamodel.EventParameters()
+        ep.add(origin)
+        obj = ep
+        expect = b"<EventParameters"
+    else:
+        obj = origin
+        expect = b"<Origin"
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False, mode="r+") as f:
         path = f.name
     ar = seiscomp.io.XMLArchive()
     ar.setFormattedOutput(True)
     if not ar.create(path):
         raise RuntimeError("Could not create output XML")
-    ar.writeObject(origin)   # Origin directly, NOT wrapped in EventParameters
+    ar.writeObject(obj)
     ar.close()
     with open(path, "rb") as f:
         xml_bytes = f.read()
     if not xml_bytes.lstrip().startswith(b"<?xml"):
         raise RuntimeError("generated output does not begin with an XML declaration")
-    if b"<Origin" not in xml_bytes:
-        raise RuntimeError("generated output contains no <Origin> element")
+    if expect not in xml_bytes:
+        raise RuntimeError(f"generated output missing expected element {expect!r}")
     try:
         os.unlink(path)
     except OSError:
@@ -612,6 +616,13 @@ def main():
     parser.add_argument("--max-dist", type=float, default=None)
     parser.add_argument("--fixed-depth", type=float, default=None)
     parser.add_argument("--ignore-initial-location", action="store_true")
+    parser.add_argument(
+        "--wrap-eventparameters", action="store_true",
+        help="wrap the output Origin in an <EventParameters> element so the "
+             "document can be fed straight to scdispatch (-O merge) for "
+             "standalone/batch relocation. The DEFAULT is a bare <Origin>, "
+             "which is what scolv's LocExt reader requires; only use this "
+             "flag when driving the plugin outside scolv.")
     args, unknown = parser.parse_known_args()
     if unknown:
         log(f"ignoring unknown args: {unknown}")
@@ -643,7 +654,7 @@ def main():
                 if not line or line.startswith("#"):
                     continue
                 net, sta, lat, lon, elev = line.split(",")[:5]
-                if net.lower() == 'network': continue
+                if net == 'network': continue
                 stations[(net, sta)] = (float(lat), float(lon), float(elev))
 
     # origin_info: plain dict; arrivals_in: list of plain dicts; ep is a
@@ -708,7 +719,7 @@ def main():
             for a in arrivals_in
         )).encode()
     ).hexdigest()[:8]
-    log(f" > > > input: initial=({lat0:.4f}, {lon0:.4f}, dep {dep0:.1f} km), "
+    log(f"input: initial=({lat0:.4f}, {lon0:.4f}, dep {dep0:.1f} km), "
         f"{len(arrivals_in)} arrivals, fingerprint={_afp}, "
         f"ignore_initial={args.ignore_initial_location}, "
         f"fixed_depth={args.fixed_depth}")
@@ -729,7 +740,7 @@ def main():
     # station is and flag any beyond max_dist_km. Beyond that limit no
     # traveltime grid is built, so the arrival is dropped later with no
     # obvious reason; logging it here removes the mystery.
-    _maxd = float(cfg.get("max_dist_km", 900.0))
+    _maxd = float(cfg.get("max_dist_km", 1000.0))
     if stations:
         _too_far = []
         _dists = []
@@ -972,13 +983,13 @@ def main():
         if sharded:
             report = ensure_traveltimes_sharded(
                 shard_dir, requests, velocity_models,
-                max_dist=float(cfg.get("max_dist_km", 900.0)),
+                max_dist=float(cfg.get("max_dist_km", 1000.0)),
                 nproc=cfg.get("ensure_nproc"),
             )
         else:
             report = ensure_traveltimes(
                 inv_path, requests, velocity_models,
-                max_dist=float(cfg.get("max_dist_km", 900.0)),
+                max_dist=float(cfg.get("max_dist_km", 1000.0)),
                 nproc=cfg.get("ensure_nproc"),
             )
         if report["computed"]:
@@ -1396,7 +1407,7 @@ def main():
         d.setUncertainty(float(dz))
         origin.setDepth(d)
 
-    write_output(origin)
+    write_output(origin, wrap_eventparameters=args.wrap_eventparameters)
 
 
 if __name__ == "__main__":
