@@ -60,6 +60,7 @@ def main():
             if len(row) < 4:
                 continue
             net, sta = row[0].strip(), row[1].strip()
+            if net.lower() == 'network': continue
             try:
                 lat, lon = float(row[2]), float(row[3])
                 elev = float(row[4]) if len(row) > 4 and row[4].strip() else 0.0

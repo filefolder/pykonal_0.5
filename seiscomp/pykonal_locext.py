@@ -643,6 +643,7 @@ def main():
                 if not line or line.startswith("#"):
                     continue
                 net, sta, lat, lon, elev = line.split(",")[:5]
+                if net.lower() == 'network': continue
                 stations[(net, sta)] = (float(lat), float(lon), float(elev))
 
     # origin_info: plain dict; arrivals_in: list of plain dicts; ep is a
