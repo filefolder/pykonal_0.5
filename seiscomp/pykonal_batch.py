@@ -1030,9 +1030,12 @@ def main():
          EQLocator(inventory_path,
                    coord_sys=transform.coord_sys) as locator:
         locator.default_pick_error = default_pick_error
-        # edt_reg is the one optional EDT knob (opt-in; 0 = pure EDT).
-        if hasattr(locator, "edt_reg") and "edt_reg" in cfg:
-            locator.edt_reg = float(cfg["edt_reg"])
+        # EDT_OT_WT (NonLinLoc LOCMETH EDT_OT_WT), on by default. The old
+        # edt_reg quadratic regularization has been removed.
+        if hasattr(locator, "edt_ot_wt"):
+            locator.edt_ot_wt = bool(cfg.get("edt_ot_wt", True))
+        if hasattr(locator, "edt_exponent") and cfg.get("edt_exponent") is not None:
+            locator.edt_exponent = float(cfg["edt_exponent"])
         # Optionally solve using only the N geographically-closest arrivals,
         # while still reporting residuals for ALL of them. Distant arrivals
         # in a 1D model carry systematic Pn/model error that can drag the

@@ -7,7 +7,7 @@ pykonal_validation.py
 Self-contained, **no-input** validation and benchmarking suite for the
 (beta) ``pykonal`` package -- the spherical Eikonal solver, the point-source
 solver, the traveltime inventory, and the ``EQLocator`` earthquake-location
-machinery (EDT / L1 objectives, alpha / edt_reg / edt_exponent parameters,
+machinery (EDT / L1 objectives, alpha / edt_ot_wt / edt_exponent parameters,
 and the Hessian-vs-uniform posterior sampler).
 
 Everything runs in the package's native **spherical** ``(r, theta, phi)``
@@ -34,7 +34,7 @@ PointSourceSolver, causal stencil); field IO/interpolation; inventory
 build/read/masking; EDT-vs-L1 recovery; a PERFORMANCE MATRIX across station
 count, P/P+S, pick dropout, added noise/outliers and azimuthal coverage
 (surrounded / one-sided / 120-deg gap); parameter sweeps (alpha 0..0.09 by
-0.005, edt_reg x geometry, edt_exponent, posterior proposal, determinism);
+0.005, edt_ot_wt x geometry, edt_exponent, posterior proposal, determinism);
 a VERTICAL-COMPRESSION study trading depth precision against model size to
 find the optimal dx:dz ratio; quality metrics; and edge cases.
 
@@ -963,7 +963,7 @@ def test_inventory_maxdist_mask(ctx):
 # SECTION 4 -- EQLocator end-to-end: EDT vs L1
 # ===========================================================================
 def _locate_batch(ctx, regime, shared_inv, stations, method, alpha=None,
-                  edt_reg=0.0, n_outliers=0, exponent=None,
+                  edt_ot_wt=True, n_outliers=0, exponent=None,
                   n_events=None, rng=None, do_posterior=False):
     """Locate a batch of synthetic events; return arrays of errors + metrics."""
     L = ctx["locate"]
@@ -977,8 +977,7 @@ def _locate_batch(ctx, regime, shared_inv, stations, method, alpha=None,
     loc = L.EQLocator(path, coord_sys="spherical")
     try:
         loc.add_stations({k: v for k, v in stations.items()})
-        if edt_reg:
-            loc.edt_reg = edt_reg
+        loc.edt_ot_wt = edt_ot_wt
         if exponent is not None:
             loc.edt_exponent = exponent
         for ev in events:
@@ -1243,22 +1242,25 @@ def test_alpha_sweep(ctx, shared):
             "message": "median total error vs alpha (0 to 0.09 step 0.005)"}
 
 
-def test_edt_reg_geometry(ctx, shared):
-    """edt_reg should help (or not hurt much) on surrounded geometry and is
-    expected to hurt on one-sided geometry -- we report both."""
+def test_edt_ot_wt_geometry(ctx, shared):
+    """EDT_OT_WT (NonLinLoc LOCMETH EDT_OT_WT) penalises the pdf by the
+    spread of the per-arrival origin-time estimates. It should help most
+    where the pdf has spurious maxima -- weak geometry with outlier picks --
+    and be roughly neutral on clean, well-surrounded events. Replaces the
+    old edt_reg sweep; edt_reg has been removed."""
     regime = shared["primary"]
     surr = shared["primary_stations"]
     one = shared["primary_onesided_stations"]
     out = {}
     for label, st, invkey in (("surrounded", surr, "primary_inv"),
                               ("one_sided", one, "primary_onesided_inv")):
-        for reg in (0.0, 0.1):
+        for otwt in (False, True):
             m, _ = _locate_batch(ctx, regime, shared[invkey], st, "edt",
-                                 edt_reg=reg, n_outliers=1,
+                                 edt_ot_wt=otwt, n_outliers=1,
                                  rng=np.random.default_rng(9))
-            out[f"{label}_reg{reg}"] = m["total_km_med"]
+            out[f"{label}_ot_wt_{'on' if otwt else 'off'}"] = m["total_km_med"]
     return {"metrics": out,
-            "message": "median total error: geometry x edt_reg"}
+            "message": "median total error: geometry x edt_ot_wt"}
 
 
 def test_edt_exponent_sweep(ctx, shared):
@@ -1732,7 +1734,7 @@ def build_shared(ctx, suite, active_names):
         shared["primary_inv"] = shared["inv"][primary_name]
         shared["primary_stations"] = shared["stations"][primary_name]
 
-    # one-sided geometry for the primary regime (edt_reg x geometry test)
+    # one-sided geometry for the primary regime (edt_ot_wt x geometry test)
     def _onesided():
         rng = np.random.default_rng(RNG_SEED + 1)
         stations = one_sided_stations(primary, rng)
@@ -1815,7 +1817,7 @@ def main():
     # --- parameter sweeps ---
     suite.section("5. parameter sweeps")
     suite.run("alpha sweep", test_alpha_sweep, ctx, shared)
-    suite.run("edt_reg x geometry", test_edt_reg_geometry, ctx, shared)
+    suite.run("edt_ot_wt x geometry", test_edt_ot_wt_geometry, ctx, shared)
     suite.run("edt_exponent sweep", test_edt_exponent_sweep, ctx, shared)
     suite.run("posterior proposal (hessian vs uniform)",
               test_posterior_proposal, ctx, shared)

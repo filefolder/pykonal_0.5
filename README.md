@@ -2,7 +2,7 @@
 
 # >>> This is a forked "0.5" version required to run PyKonal on modern systems and is necessary for PyVoroTomo version 2 <<<
 
-There are a few critical as well as smaller improvements.
+There are a few critical and numerous small improvements. The biggest is the addition of an Equal Differential Time solver (similar to NLL) as well as a seiscomp plugin (via locext).
 
 See the original for details on how the code works: https://github.com/malcolmw/pykonal
 

@@ -49,7 +49,7 @@ selected, else global); the teleseismic test and per-regime sweeps are gated.
    random events and reports median & p90 epicentral / depth / total error,
    median azimuthal gap, median `nobs`, and (where sampled) posterior ESS.
 5. **parameter sweeps** — `alpha` swept **0 → 0.09 in 0.005 steps** (with the
-   best-scoring alpha reported), `edt_reg` × geometry, `edt_exponent`,
+   best-scoring alpha reported), `edt_ot_wt` × geometry, `edt_exponent`,
    posterior proposal (Hessian vs uniform, cross-checked against a
    scatter-derived physical ellipsoid), `locate_seed` determinism, and the
    `alpha`-not-reset regression.

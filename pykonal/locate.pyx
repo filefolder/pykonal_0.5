@@ -17,6 +17,7 @@ from . import transformations as _transformations
 cimport numpy as np
 
 from libc.math cimport sqrt, isinf, isnan, INFINITY, NAN, exp, log, atan2, M_PI, fmod, sin, cos, asin
+from libc.math cimport sqrt as math_sqrt
 
 from . cimport fields
 from . cimport constants
@@ -43,7 +44,14 @@ cdef class EQLocator(object):
         self.cy_stations            = {}
         self.cy_pick_errors         = {}
         self.cy_default_pick_error  = 0.02  # seconds
-        self.cy_edt_exponent        = 1.0
+        # NaN = "use the number of arrivals", matching NonLinLoc's EDT pdf
+        # (the pair sum raised to the power N). Set a number to override.
+        # This was 1.0, which is a monotone transform of the same surface
+        # and so gave the same mode -- but it is NOT equivalent once the
+        # EDT_OT_WT term is added, because that term is a fixed-scale
+        # log-probability penalty added after the power, and its relative
+        # weight depends on the exponent being N.
+        self.cy_edt_exponent        = NAN
         # Quadratic regularization weight blended into the EDT log-
         # likelihood. Adding a small quadratic differential-time misfit
         # restores curvature along EDT's otherwise-flat ridges, which on
@@ -55,7 +63,16 @@ cdef class EQLocator(object):
         # far off (benchmarks: ~23 km -> ~120 km error). It is therefore
         # OPT-IN and defaults to 0 (pure NLL-style EDT). Enable it (e.g.
         # 0.05-0.2) only for networks whose events are well surrounded.
-        self.cy_edt_reg             = 0.0
+        # EDT_OT_WT: penalise the pdf by the spread of the per-arrival
+        # origin-time estimates. On by default -- this is NonLinLoc's
+        # recommended LOCMETH, and it replaces the quadratic
+        # regularization this class used to carry.
+        self.cy_edt_ot_wt           = True
+        # NLL's EDT_OT_WT_FLOOR: the OT penalty cannot suppress the pdf by
+        # more than a factor of 1e-5, so a wildly inconsistent trial point
+        # is heavily disfavoured but never assigned exactly zero
+        # probability (which would punch holes in the search surface).
+        self.cy_edt_ot_wt_floor     = log(0.00001)
         # Differential-evolution search controls for the EDT locator.
         # Larger popsize/maxiter make the global search more robust on
         # rough/ridged surfaces at the cost of runtime; tol is the DE
@@ -68,6 +85,7 @@ cdef class EQLocator(object):
         self.cy_keys                = None
         self.cy_tt_fields           = None
 
+        self.cy_edge_axes = None
         self.cy_traveltime_inventory = None
         inventory = _inventory.TraveltimeInventory(traveltime_inventory, mode="r")
         self.cy_traveltime_inventory = inventory
@@ -268,34 +286,62 @@ cdef class EQLocator(object):
     @property
     def edt_exponent(self):
         """
-        Exponent applied to the EDT stack (NLL's PDF sharpening). 1.0 gives
-        the classic EDT sum; larger values sharpen the posterior toward the
-        best-fitting region as in NLL's EDT^N option.
+        Exponent applied to the EDT stack (NLL's pdf sharpening).
+
+        None (the default) means "the number of arrivals", which is what
+        NonLinLoc uses: its EDT pdf is the pair sum raised to the power N.
+        Set a number to override; 1 gives the raw, most conservative EDT
+        surface.
+
+        This is not a cosmetic choice now that EDT_OT_WT is active. The
+        origin-time penalty is added after the power, so the exponent sets
+        the balance between the two terms.
         """
+        if isnan(self.cy_edt_exponent):
+            return None
         return self.cy_edt_exponent
 
     @edt_exponent.setter
     def edt_exponent(self, value):
+        if value is None:
+            self.cy_edt_exponent = NAN
+            return
         if value <= 0:
-            raise ValueError("edt_exponent must be > 0")
+            raise ValueError("edt_exponent must be > 0, or None for auto")
         self.cy_edt_exponent = value
 
     @property
-    def edt_reg(self):
+    def edt_ot_wt(self):
         """
-        Quadratic-regularization weight added to the EDT log-likelihood to
-        break the flat-ridge degeneracy on weak geometry. 0 disables it
-        (pure EDT); larger values sharpen the minimum at some cost to
-        outlier robustness. Default 0 (disabled); see the note in
-        __init__ before enabling it on one-sided networks.
-        """
-        return self.cy_edt_reg
+        Enable NonLinLoc's EDT_OT_WT (default True): penalise the EDT pdf
+        by the weighted variance of the per-arrival origin-time estimates,
+        so that points which satisfy many differential times but imply
+        mutually inconsistent origin times are suppressed. This is what
+        makes EDT pdfs compact without sacrificing outlier robustness.
 
-    @edt_reg.setter
-    def edt_reg(self, value):
-        if value < 0:
-            raise ValueError("edt_reg must be >= 0")
-        self.cy_edt_reg = value
+        Set False for the plain EDT pair sum.
+        """
+        return bool(self.cy_edt_ot_wt)
+
+    @edt_ot_wt.setter
+    def edt_ot_wt(self, value):
+        self.cy_edt_ot_wt = bool(value)
+
+    @property
+    def edt_ot_wt_floor(self):
+        """
+        Lower bound on the EDT_OT_WT log-penalty (default log(1e-5), as in
+        NLL). Bounds how far the origin-time term can suppress the pdf, so
+        badly inconsistent regions stay improbable rather than becoming
+        exactly zero and tearing holes in the search surface.
+        """
+        return self.cy_edt_ot_wt_floor
+
+    @edt_ot_wt_floor.setter
+    def edt_ot_wt_floor(self, value):
+        if value >= 0:
+            raise ValueError("edt_ot_wt_floor must be negative (a log)")
+        self.cy_edt_ot_wt_floor = value
 
     @property
     def locate_seed(self):
@@ -370,6 +416,7 @@ cdef class EQLocator(object):
             dtype=np.float64
         )
         self.cy_tt_work   = np.empty(n, dtype=np.float64)
+        self.cy_ot_work   = np.empty(n, dtype=np.float64)
 
         return True
 
@@ -399,28 +446,87 @@ cdef class EQLocator(object):
         return valid
 
 
+    cdef constants.REAL_t _effective_exponent(EQLocator self, int n):
+        """
+        Exponent applied to the EDT stack. NaN (the default) means "use the
+        number of arrivals", which is what NonLinLoc does: its EDT pdf is
+        the pair sum raised to the power N, and its oct-tree search works
+        on that. Any explicit value overrides it.
+
+        The arrival COUNT is used rather than the count of arrivals whose
+        grids cover the trial point, deliberately. Using the covered count
+        makes the exponent a function of position, which puts a step in the
+        likelihood at every grid edge -- the discontinuity NLL flags in its
+        own source (20200619) as a reason not to weight by the reading
+        count.
+        """
+        if isnan(self.cy_edt_exponent):
+            return <constants.REAL_t> n
+        return self.cy_edt_exponent
+
+
     cpdef constants.REAL_t edt_log_likelihood(
         EQLocator self,
         constants.REAL_t[:] hypo_xyz
     ):
         """
-        NLL-style Equal Differential Time (EDT) log-likelihood at a trial
-        hypocenter (3 spatial coordinates only; origin time cancels).
+        NonLinLoc's Equal Differential Time log-likelihood at a trial
+        hypocenter (3 spatial coordinates; origin time cancels).
 
-        For every pair of arrivals (a, b):
+        For every pair of arrivals (a, b), with
+        s^2 = pick_error^2 + (alpha * tt)^2 combining pick uncertainty with
+        a fractional traveltime (velocity-model) error:
 
-            r_ab = (t_obs_a - t_obs_b) - (tt_a - tt_b)
-            L   += exp(-r_ab^2 / (s_a^2 + s_b^2)) / sqrt(s_a^2 + s_b^2)
+            r_ab  = (t_obs_a - t_obs_b) - (tt_a - tt_b)
+            v_ab  = s_a^2 + s_b^2
+            p_ab  = exp(-0.5 * r_ab^2 / v_ab) / sqrt(v_ab)
+            L     = sum_ab p_ab
 
-        where s^2 = pick_error^2 + (alpha * tt)^2 combines pick uncertainty
-        with a fractional traveltime (velocity-model) error, mirroring the
-        role of alpha in the weighted-RMS objective. Returns
-        edt_exponent * log(L / n_pairs); larger is better.
+        and the returned log-likelihood is
+
+            N * log(L / n_pairs)  +  ot_var_weight
+
+        NOTE THE FACTOR OF 0.5. Earlier versions used
+        exp(-r^2 / v) with no 0.5, which is not the density of a difference
+        of two Gaussians and made the kernel narrower than intended by a
+        factor of sqrt(2) in effective sigma -- i.e. every pick was being
+        treated as sqrt(2) times more precise than its stated error. NLL's
+        reference implementation (NLLocLib.c, CalcSolutionQuality_EDT:
+        `prob = exp(-0.5 * edt_misfit * edt_misfit * weight2)`) has the 0.5.
+        Correcting it widens the likelihood, so pick errors and alpha tuned
+        against the old kernel will now behave as if they were sqrt(2)
+        larger; re-check them if you had them dialled in.
+
+        ot_var_weight is the EDT_OT_WT term (LOCMETH EDT_OT_WT). Each
+        arrival implies its own origin time, ot_i = t_obs_i - tt_i. At the
+        true hypocenter these agree; at a point that happens to satisfy many
+        differential times by coincidence they scatter. So NLL penalises
+        the pdf by the spread of those origin-time estimates, weighted by
+        each arrival's accumulated EDT probability:
+
+            w_i           = sum_{j != i} p_ij
+            ot_var        = weighted variance of ot_i under w_i
+            ot_var_weight = -ot_var / mean(s_i^2),  floored at log(1e-5)
+
+        This replaces the quadratic regularization term this class used to
+        carry. That term added an L2 differential-time misfit, which
+        reintroduces exactly the outlier sensitivity EDT exists to avoid --
+        hence its failure on one-sided geometry. The OT-variance term
+        instead sharpens the pdf using a statistic computed from the robust
+        pair weights, so a single bad pick contributes negligible w_i and
+        barely moves it.
+
+        The term is added AFTER the power of N, not inside it, matching
+        NLL: it is a fixed-scale log-probability penalty, not something
+        that grows with the reading count.
         """
-        cdef int    ia, ib, n, npairs = 0
-        cdef constants.REAL_t tta, ttb, r, va, vb, vv
+        cdef int    ia, ib, n, npairs = 0, nvalid = 0
+        cdef constants.REAL_t tta, ttb, r, va, vb, vv, prob
         cdef constants.REAL_t stack = 0.0
-        cdef constants.REAL_t reg_sum = 0.0
+        cdef constants.REAL_t ot_i, ot_w
+        cdef constants.REAL_t ot_sum = 0.0, ot_2_sum = 0.0, ot_wsum = 0.0
+        cdef constants.REAL_t sig2_sum = 0.0
+        cdef constants.REAL_t ot_mean, ot_var, ot_var_weight = 0.0
         cdef constants.REAL_t alpha_sq = self.cy_alpha * self.cy_alpha
 
         if self.cy_keys is None:
@@ -429,6 +535,10 @@ cdef class EQLocator(object):
         n = len(self.cy_keys)
         if self._fill_traveltimes(hypo_xyz) < 2:
             return -INFINITY
+
+        if self.cy_edt_ot_wt:
+            for ia in range(n):
+                self.cy_ot_work[ia] = 0.0
 
         for ia in range(n - 1):
             tta = self.cy_tt_work[ia]
@@ -442,19 +552,53 @@ cdef class EQLocator(object):
                 vb = self.cy_sigma[ib] * self.cy_sigma[ib] + alpha_sq * ttb * ttb
                 vv = va + vb
                 r = (self.cy_obs[ia] - self.cy_obs[ib]) - (tta - ttb)
-                stack += exp(-(r * r) / vv) / sqrt(vv)
-                reg_sum += (r * r) / vv     # quadratic differential misfit
+                prob = exp(-0.5 * (r * r) / vv) / sqrt(vv)
+                stack += prob
                 npairs += 1
+                if self.cy_edt_ot_wt:
+                    # Accumulate each pair's probability onto BOTH arrivals.
+                    # NLL's EDT_OT_WT credits it only to the lower-indexed
+                    # one, so its last arrival contributes zero weight to
+                    # the origin-time statistics and the result depends on
+                    # arrival ordering. That looks like an oversight rather
+                    # than intent: the EDT_OT_WT_ML branch of the same
+                    # function accumulates onto both, under a comment
+                    # reading "AJL 20070326 bug fix!". We follow the fixed
+                    # branch.
+                    self.cy_ot_work[ia] += prob
+                    self.cy_ot_work[ib] += prob
 
         if npairs == 0 or stack <= 0.0:
             return -INFINITY
 
-        # EDT log-likelihood (flat-topped, outlier-robust) minus a small
-        # quadratic differential-time misfit that restores curvature along
-        # otherwise-degenerate ridges. With cy_edt_reg = 0 this is exactly
-        # the classic NLL EDT.
-        return (self.cy_edt_exponent * log(stack / npairs)
-                - self.cy_edt_reg * (reg_sum / npairs))
+        if self.cy_edt_ot_wt:
+            for ia in range(n):
+                tta = self.cy_tt_work[ia]
+                if isinf(tta):
+                    continue
+                sig2_sum += (
+                    self.cy_sigma[ia] * self.cy_sigma[ia]
+                    + alpha_sq * tta * tta
+                )
+                nvalid += 1
+                ot_i = self.cy_obs[ia] - tta
+                ot_w = self.cy_ot_work[ia]
+                ot_sum += ot_w * ot_i
+                ot_2_sum += ot_w * ot_i * ot_i
+                ot_wsum += ot_w
+            if ot_wsum > 0.0 and nvalid > 0:
+                ot_mean = ot_sum / ot_wsum
+                ot_var = ot_2_sum / ot_wsum - ot_mean * ot_mean
+                if ot_var < 0.0:        # rounding on a perfectly consistent fit
+                    ot_var = 0.0
+                ot_var_weight = -ot_var / (sig2_sum / nvalid)
+                if ot_var_weight < self.cy_edt_ot_wt_floor:
+                    ot_var_weight = self.cy_edt_ot_wt_floor
+
+        return (
+            self._effective_exponent(n) * log(stack / npairs)
+            + ot_var_weight
+        )
 
 
     cpdef constants.REAL_t edt(EQLocator self, constants.REAL_t[:] hypo_xyz):
@@ -469,12 +613,65 @@ cdef class EQLocator(object):
         return -ll
 
 
+    def edt_ot_stats(EQLocator self, hypo_xyz):
+        """
+        Origin-time statistics from the EDT pair weights at a fixed
+        hypocenter. Returns (mean, variance, weights, ot) where `ot` holds
+        each valid arrival's implied origin time t_obs - tt and `weights`
+        holds its accumulated pair probability.
+
+        This is the same quantity the EDT_OT_WT term inside
+        edt_log_likelihood computes; it is exposed separately (and
+        vectorised rather than looped, since it runs once per solution
+        rather than once per likelihood evaluation) so the origin time and
+        its scatter can be reported and inspected.
+        """
+        hypo_xyz = np.ascontiguousarray(hypo_xyz[:3], dtype=np.float64)
+        if self.cy_keys is None:
+            self._prepare_workspace()
+        if self._fill_traveltimes(hypo_xyz) < 2:
+            return np.nan, np.nan, np.zeros(0), np.zeros(0)
+
+        alpha_sq = self.cy_alpha * self.cy_alpha
+        tt_all = np.asarray(self.cy_tt_work)
+        valid = np.isfinite(tt_all)
+        tt = tt_all[valid]
+        obs = np.asarray(self.cy_obs)[valid]
+        sig = np.asarray(self.cy_sigma)[valid]
+
+        sig2 = sig * sig + alpha_sq * tt * tt
+        vv = sig2[:, None] + sig2[None, :]
+        r = (obs[:, None] - obs[None, :]) - (tt[:, None] - tt[None, :])
+        prob = np.exp(-0.5 * (r * r) / vv) / np.sqrt(vv)
+        np.fill_diagonal(prob, 0.0)
+
+        w = prob.sum(axis=1)
+        ot = obs - tt
+        wsum = w.sum()
+        if wsum <= 0:
+            return np.nan, np.nan, w, ot
+        mean = float(w @ ot / wsum)
+        var = float(w @ (ot - mean) ** 2 / wsum)
+        return mean, var, w, ot
+
+
     cpdef constants.REAL_t origin_time(EQLocator self, constants.REAL_t[:] hypo_xyz):
         """
-        Origin time at a fixed hypocenter: the inverse-variance *weighted
-        median* of (t_obs - tt). The median (rather than mean)
-        keeps the decoupled origin-time estimate robust to the same outlier
-        picks that EDT itself is immune to.
+        Origin time at a fixed hypocenter.
+
+        With edt_ot_wt on (the default) this is NonLinLoc's EDT_OT_WT
+        estimator: the mean of the per-arrival origin times t_obs - tt,
+        weighted by each arrival's accumulated EDT pair probability
+        (NLLocLib.c: `*potime = ot_sum / ot_weight`). It is robust for the
+        same reason the EDT stack is -- an outlier pick satisfies few pairs,
+        so its weight collapses -- and it is the estimator consistent with
+        the objective actually being maximised.
+
+        With edt_ot_wt off, falls back to the previous behaviour: the
+        inverse-variance weighted MEDIAN. That is also robust, but it is a
+        step function of position, which makes the recovered origin time
+        jump between picks as the hypocenter moves and would give a lumpy
+        marginal if t0 were ever added to the posterior.
         """
         cdef int idx, n
 
@@ -484,6 +681,13 @@ cdef class EQLocator(object):
         n = len(self.cy_keys)
         if self._fill_traveltimes(hypo_xyz) == 0:
             return np.nan
+
+        if self.cy_edt_ot_wt:
+            mean, _, w, _ = self.edt_ot_stats(hypo_xyz)
+            if np.isfinite(mean):
+                return mean
+            # fall through to the median if the pair weights degenerate
+            # (fewer than two usable arrivals)
 
         alpha_sq = self.cy_alpha * self.cy_alpha
         tt = np.asarray(self.cy_tt_work)
@@ -678,7 +882,7 @@ cdef class EQLocator(object):
         box, keep the best sample, contract the box around it, resample,
         and repeat. Because the estimate is the peak of a sampled surface
         (not an optimizer landing point), it is stable against the starting
-        origin and does not require fabricating curvature (no edt_reg).
+        origin and does not require fabricating curvature.
         A final local polish refines to sub-node precision. The companion
         sample_posterior() then reports the honest (often large) ellipsoid.
 
@@ -752,18 +956,68 @@ cdef class EQLocator(object):
         return residuals
 
 
+    def _metric_scale(self, x):
+        """
+        Diagonal factors converting a small offset in GRID coordinates at
+        position `x` into physical kilometres.
+
+        Cartesian grids are already in km, so this is (1, 1, 1). Spherical
+        grids use (r [km], theta [rad, colatitude], phi [rad, longitude]),
+        where an offset (dr, dtheta, dphi) spans
+        (dr, r*dtheta, r*sin(theta)*dphi) kilometres.
+
+        ALL curvature, covariance and ellipsoid computation below is done
+        in this local km frame. Mixing km with radians -- as earlier
+        versions did -- makes finite-difference steps, eigenvalue floors
+        and ellipsoid semi-axes meaningless on spherical grids: floors
+        derived from a radial half-width in km were applied to angular
+        variances in rad^2, inflating horizontal sigma to hundreds of km,
+        which in turn made almost every proposal draw fall outside the
+        search box and silently forced the uniform fallback. The reported
+        confidence ellipsoid was likewise an eigendecomposition of a
+        matrix whose entries had three different units.
+
+        The km frame's axes are r_hat, theta_hat, phi_hat (up, south,
+        east): mutually orthogonal, so eigenvectors computed in it are
+        genuine physical principal axes.
+        """
+        if self.cy_coord_sys == "cartesian":
+            return np.ones(3, dtype=np.float64)
+        r = float(x[0])
+        # guard the poles, where the phi metric degenerates
+        sin_theta = max(abs(np.sin(float(x[1]))), 1e-6)
+        return np.array([1.0, r, r * sin_theta], dtype=np.float64)
+
+
     def _edt_proposal_cov(self, mode, scale, delta):
         """
-        Local covariance for the posterior proposal: -inv(H) where H is the
-        finite-difference Hessian of the (sharpened) EDT log-likelihood at
-        `mode`. Eigenvalues are floored and capped so that flat or
-        non-concave directions -- routine on one-sided geometry, where the
-        EDT surface is deliberately flat-topped -- give a broad but finite
-        proposal rather than a singular one.
+        Local covariance IN KM^2 for the posterior proposal: -inv(H), where
+        H is the finite-difference Hessian of the (sharpened) EDT
+        log-likelihood at `mode` taken with respect to the local km frame
+        (see _metric_scale). Eigenvalues are floored and capped so that
+        flat or non-concave directions -- routine on one-sided geometry,
+        where the EDT surface is deliberately flat-topped -- give a broad
+        but finite proposal rather than a singular one.
+
+        Returns a 3x3 covariance in km^2 in the (r_hat, theta_hat, phi_hat)
+        frame (plain xyz for cartesian grids), or None if the surface is
+        unusable at `mode`.
         """
         cdef int i, j
 
-        step = np.maximum(0.002 * np.asarray(delta, dtype=np.float64), 0.05)
+        s = self._metric_scale(mode)
+        delta_km = np.abs(np.asarray(delta, dtype=np.float64)[:3]) * s
+
+        # Finite-difference step: 0.2% of the search half-width, floored at
+        # 50 m so the stencil is not lost in interpolation noise, and capped
+        # at a quarter of the box so it stays local and inside the grids.
+        step_km = np.clip(
+            0.002 * delta_km,
+            0.05,
+            np.maximum(0.25 * delta_km, 0.05)
+        )
+        step = step_km / s      # the same displacement, in grid units
+
         H = np.zeros((3, 3), dtype=np.float64)
 
         def ll(x):
@@ -775,31 +1029,88 @@ cdef class EQLocator(object):
         if not np.isfinite(f0):
             return None
 
+        def at(offsets):
+            """log-likelihood at mode + offsets (grid units), or None when
+            the point falls outside the traveltime grids."""
+            q = mode.copy()
+            for axis, k in offsets:
+                q[axis] += k * step[axis]
+            val = ll(q)
+            return val if np.isfinite(val) else None
+
+        # Axes on which the solution sits against the edge of the region
+        # for which traveltimes were read. This is routine, not
+        # exceptional: when an axis is unresolved -- depth, on a network
+        # with no near-source station -- the likelihood is monotone along
+        # it, so the mode runs to the boundary of the search volume and
+        # stops there. A centred stencil then steps off the grid.
+        #
+        # Previously ANY such step made the Hessian non-finite and this
+        # routine returned None, dropping the sampler into the uniform
+        # fallback. That is what produced fallback rates of 50-80%, and it
+        # happened precisely on the geometries where a good proposal
+        # matters most. The stencil now goes one-sided on the offending
+        # axis instead of discarding all three.
+        edge = np.zeros(3, dtype=bool)
+
         for i in range(3):
-            for j in range(i, 3):
-                if i == j:
-                    p = mode.copy(); p[i] += step[i]
-                    m = mode.copy(); m[i] -= step[i]
-                    H[i, i] = (ll(p) - 2.0 * f0 + ll(m)) / (step[i] ** 2)
+            plus = at([(i, 1.0)])
+            minus = at([(i, -1.0)])
+            if plus is not None and minus is not None:
+                H[i, i] = (plus - 2.0 * f0 + minus) / (step_km[i] ** 2)
+            else:
+                # One-sided second difference on whichever side is inside
+                # the grid: f(x) - 2f(x+h) + f(x+2h).
+                edge[i] = True
+                sgn = 1.0 if plus is not None else -1.0
+                f1 = plus if plus is not None else minus
+                f2 = at([(i, 2.0 * sgn)])
+                if f1 is None or f2 is None:
+                    # Both directions blocked: no curvature information on
+                    # this axis. Zero leaves it to the eigenvalue floor
+                    # below, which gives a broad, box-limited proposal --
+                    # the honest answer for an axis the data cannot see.
+                    H[i, i] = 0.0
                 else:
-                    v = []
-                    for si in (1.0, -1.0):
-                        for sj in (1.0, -1.0):
-                            p = mode.copy()
-                            p[i] += si * step[i]
-                            p[j] += sj * step[j]
-                            v.append(ll(p))
+                    H[i, i] = (f0 - 2.0 * f1 + f2) / (step_km[i] ** 2)
+
+        for i in range(3):
+            for j in range(i + 1, 3):
+                v = [
+                    at([(i, si), (j, sj)])
+                    for si in (1.0, -1.0) for sj in (1.0, -1.0)
+                ]
+                if any(x is None for x in v):
+                    # A blocked corner means no reliable mixed derivative.
+                    # Zero assumes the axes are locally uncorrelated, which
+                    # costs proposal efficiency but keeps the matrix
+                    # usable; failing loses everything.
+                    H[i, j] = H[j, i] = 0.0
+                else:
                     H[i, j] = H[j, i] = (
                         (v[0] - v[1] - v[2] + v[3])
-                        / (4.0 * step[i] * step[j])
+                        / (4.0 * step_km[i] * step_km[j])
                     )
+
+        self.cy_edge_axes = edge
 
         if not np.all(np.isfinite(H)):
             return None
 
         evals, evecs = np.linalg.eigh(-H)
-        big = (np.max(delta) / 2.0) ** 2
-        small = (0.002 * np.max(delta)) ** 2
+
+        # Bound each eigen-direction by the extent of the search box ALONG
+        # THAT DIRECTION, not by the largest half-width of the box. A flat
+        # (non-concave) direction gets the fallback variance `big`, and
+        # with a single scalar `big = max(delta_km)/2` a flat DEPTH
+        # direction in a box 15 km deep and 30 km wide was assigned a 15 km
+        # sigma -- wider than the box it has to be sampled inside. Most
+        # draws then landed outside and the whole proposal bailed out to
+        # the uniform fallback, which is what drove the 50-80% fallback
+        # rates on depth-unresolved geometry.
+        half = 0.5 * np.sqrt(((evecs.T * delta_km) ** 2).sum(axis=1))
+        big = half ** 2
+        small = np.maximum((0.002 * half) ** 2, 1.0e-4)        # >= 10 m
         var = np.where(evals > 1e-8, 1.0 / np.maximum(evals, 1e-8), big)
         var = np.clip(var, small, big)
         return evecs @ np.diag(var) @ evecs.T
@@ -807,27 +1118,80 @@ cdef class EQLocator(object):
 
     def sample_posterior(self, hypocenter, delta, nsamples=4096, nscatter=1024,
                          seed=None, exponent=None, proposal="hessian",
-                         inflate=3.0, rounds=2):
+                         inflate=3.0, rounds=2, center="solution",
+                         search_delta=None, include_time=True):
         """
         NLL-style posterior characterization around a solution: importance
         sampling of the EDT likelihood over hypocenter +/- delta (3-vectors
         or the first 3 elements of 4-vectors).
 
         Returns a dict with:
-          scatter    : (nscatter, 3) posterior sample cloud (NLL SCAT analog)
-          mean       : (3,) posterior expected hypocenter
-          covariance : (3, 3) posterior covariance
-          ellipsoid  : dict with 'semi_axes' (1-sigma lengths, sorted
-                       descending) and 'axes' (unit vectors, rows matching
-                       semi_axes) from the covariance eigendecomposition
-          ess        : effective sample size of the importance weights
-          proposal   : which proposal was actually used
+          scatter       : (nscatter, 3) posterior sample cloud in GRID
+                          coordinates (NLL SCAT analog)
+          mean          : (3,) posterior expected hypocenter, grid coords
+                          (NLL's "expectation" solution)
+          center        : which point the reported covariance is taken
+                          about, "solution" (default) or "mean"
+          mode_minus_mean_km : (3,) offset between the two, in km. Large
+                          values mean a strongly skewed posterior, and are
+                          the signal that the choice of `center` matters
+          covariance    : (3, 3) posterior covariance in RAW GRID units.
+                          On a spherical grid these units are mixed
+                          (km, rad, rad) -- retained for backward
+                          compatibility only. Prefer covariance_km.
+          covariance_km : (3, 3) posterior covariance in km^2, expressed in
+                          the local orthonormal frame at the solution
+                          (r_hat, theta_hat, phi_hat = up, south, east for
+                          spherical grids; xyz for cartesian).
+          ellipsoid     : legacy raw-coordinate eigendecomposition of
+                          `covariance` (deprecated; meaningless units on
+                          spherical grids)
+          ellipsoid_km  : dict with 'semi_axes' (1-sigma lengths in km,
+                          sorted descending), 'axes' (unit vectors in the
+                          local km frame, rows matching semi_axes) and
+                          'volume_km3'. THIS is the physically meaningful
+                          error ellipsoid; scale the semi-axes by the
+                          appropriate chi-square quantile (1.878 for a 68%
+                          three-dimensional confidence ellipsoid) before
+                          reporting a confidence level.
+          metric_scale  : (3,) the grid -> km factors used
+          box_limited   : True when the posterior is wide enough relative
+                          to the search box that the box, not the data, is
+                          setting the reported width. The uncertainty is
+                          then a LOWER BOUND and should be reported as
+                          unresolved rather than as a number.
+          box_fill      : per-axis sigma / search half-width, measured
+                          against `search_delta` if given, else `delta`
+          at_search_edge: per-axis flag, True where the solution sits
+                          against the edge of the searched volume. Means
+                          the likelihood is monotone along that axis: the
+                          data do not locate it, and the reported value is
+                          a boundary, not a minimum.
+          time          : origin time at the reported solution (seconds, in
+                          the same reference as the arrival times)
+          time_sigma    : 1-sigma uncertainty on the origin time
+          covariance4_km_s : (4, 4) covariance over
+                          (axis1, axis2, axis3 [km], t0 [s]) about the same
+                          point as `covariance_km`. The EDT likelihood is
+                          origin-time independent, so adding t0 does not
+                          change the spatial block -- it adds the origin
+                          time uncertainty and, more usefully, its
+                          covariance with depth.
+          depth_time_correlation : correlation between the vertical axis
+                          and origin time. Near -1 or +1 means depth and t0
+                          are trading off and neither is independently
+                          determined, which is the normal state of affairs
+                          without a near-source station.
+          sigma_rel_mcse: Monte Carlo standard error on the reported sigma,
+                          as a fraction of sigma (~1/sqrt(2*ESS))
+          ess           : effective sample size of the importance weights
+          proposal      : which proposal was actually used
 
         The raw EDT stack is a broad, heavy-tailed surface; following NLL's
         EDT^N sharpening, the posterior is taken proportional to
         stack^exponent. exponent=None (default) uses the number of arrivals,
-        approximating the information content of N independent picks;
-        pass exponent=1 for the raw (most conservative) EDT surface.
+        matching NLL's formulation; pass exponent=1 for the raw (most
+        conservative) EDT surface.
 
         proposal="hessian" (default) draws from a heavy-tailed multivariate
         t centred on the solution and scaled by the local curvature, then
@@ -841,7 +1205,7 @@ cdef class EQLocator(object):
         posterior and understates uncertainty on weak geometry, which is
         the dangerous direction to be wrong in.
 
-        proposal="uniform" restores the previous behaviour exactly.
+        proposal="uniform" restores the original behaviour.
         """
         rng = np.random.default_rng(seed)
         hypocenter = np.asarray(hypocenter, dtype=np.float64)[:3]
@@ -849,7 +1213,24 @@ cdef class EQLocator(object):
 
         if exponent is None:
             exponent = max(len(self.cy_arrivals), 1)
-        scale = exponent / self.cy_edt_exponent
+        # edt_log_likelihood already applies its own exponent (the arrival
+        # count by default), so rescale rather than re-apply. With both at
+        # the default this is exactly 1 and the likelihood passes through
+        # untouched. NOTE: the EDT_OT_WT term is scaled along with the
+        # stack here, whereas NLL adds it outside the power. They coincide
+        # at the default; a non-default `exponent` shifts the balance
+        # slightly in favour of the origin-time penalty.
+        _eff = self.edt_exponent
+        if _eff is None:
+            _eff = max(len(self.cy_keys or self.cy_arrivals), 1)
+        scale = exponent / _eff
+
+        # grid -> km factors, evaluated once at the solution. The proposal
+        # region is small enough that treating them as constant over it is
+        # accurate, and the resulting constant Jacobian cancels out of the
+        # self-normalised importance weights.
+        s = self._metric_scale(hypocenter)
+        delta_km = np.abs(delta) * s
 
         lo = hypocenter - delta
         hi = hypocenter + delta
@@ -858,12 +1239,24 @@ cdef class EQLocator(object):
         used = proposal
 
         if proposal == "hessian":
-            cov = self._edt_proposal_cov(hypocenter, scale, delta)
+            cov = self._edt_proposal_cov(hypocenter, scale, delta)   # km^2
             if cov is not None:
                 cov = cov * (inflate ** 2)
-                mu = hypocenter.copy()
+                # Cap the inflated proposal at half the search box. Draws
+                # outside the box are rejected, so an inflated proposal that
+                # is wide relative to a contracted box loses almost every
+                # sample and trips the <16 survivors bail-out into the
+                # uniform fallback -- which is exactly the degenerate path
+                # the hessian proposal exists to avoid.
+                _sig = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
+                _cap = np.min(np.maximum(0.5 * delta_km, 1e-6) / _sig)
+                if _cap < 1.0:
+                    cov = cov * (_cap ** 2)
+                mu = hypocenter.copy()             # grid coordinates
                 per = max(int(nsamples) // max(int(rounds), 1), 32)
                 df = 4.0
+                var_lo = max((0.002 * np.min(delta_km)) ** 2, 1.0e-4)
+                var_hi = np.max(delta_km) ** 2
                 for r in range(max(int(rounds), 1)):
                     try:
                         L = np.linalg.cholesky(cov)
@@ -872,34 +1265,34 @@ cdef class EQLocator(object):
                         break
                     z = rng.standard_normal((per, 3))
                     g = rng.chisquare(df, per) / df
-                    s = mu + (z / np.sqrt(g)[:, None]) @ L.T
-                    s = s[np.all((s >= lo) & (s <= hi), axis=1)]
-                    if len(s) < 16:
+                    y = (z / np.sqrt(g)[:, None]) @ L.T     # km offsets from mu
+                    cand = mu + y / s                       # back to grid units
+                    keep = np.all((cand >= lo) & (cand <= hi), axis=1)
+                    cand, y = cand[keep], y[keep]
+                    if len(cand) < 16:
                         samples = None
                         break
                     logl = np.array([
-                        scale * self.edt_log_likelihood(s_i) for s_i in s
+                        scale * self.edt_log_likelihood(c_i) for c_i in cand
                     ])
-                    d = s - mu
-                    quad = np.sum(d * np.linalg.solve(cov, d.T).T, axis=1)
+                    quad = np.sum(y * np.linalg.solve(cov, y.T).T, axis=1)
                     logq = -0.5 * (df + 3.0) * np.log1p(quad / df)
                     logw = logl - logq
                     finite = np.isfinite(logw)
                     if not finite.any():
                         samples = None
                         break
-                    samples, logw = s[finite], logw[finite]
+                    samples, y, logw = cand[finite], y[finite], logw[finite]
                     if r < max(int(rounds), 1) - 1:
-                        # adapt the proposal to the weighted moments
+                        # adapt the proposal to the weighted moments (in km)
                         wa = np.exp(logw - logw.max())
                         wa /= wa.sum()
-                        mu = wa @ samples
-                        dev = samples - mu
+                        mu_y = wa @ y
+                        mu = mu + mu_y / s
+                        dev = y - mu_y
                         c = (wa[:, None] * dev).T @ dev
                         ev, evec = np.linalg.eigh(c)
-                        ev = np.clip(
-                            ev, (0.002 * np.max(delta)) ** 2, np.max(delta) ** 2
-                        )
+                        ev = np.clip(ev, var_lo, var_hi)
                         cov = (evec @ np.diag(ev) @ evec.T) * (inflate ** 2)
             if samples is None:
                 used = "uniform (hessian fallback)"
@@ -923,12 +1316,120 @@ cdef class EQLocator(object):
 
         mean = w @ samples
         dev = samples - mean
-        cov_post = (w[:, None] * dev).T @ dev
+        cov_mean = (w[:, None] * dev).T @ dev
+
+        # Second moment about the SOLUTION rather than about the posterior
+        # mean. These differ by the outer product of the mode-mean offset,
+        # and on skewed EDT posteriors that offset is not small: on
+        # one-sided geometry it routinely equals the semi-major axis
+        # itself. Reporting a mean-centred covariance alongside a
+        # mode-centred hypocenter gives an ellipsoid that is not centred on
+        # the location it is attached to, and coverage collapses
+        # accordingly. Whichever point is published, the moment must be
+        # taken about that point.
+        dev0 = samples - np.asarray(hypocenter, dtype=np.float64)
+        cov_solution = (w[:, None] * dev0).T @ dev0
+
+        cov_post = cov_solution if center == "solution" else cov_mean
+
+        # Physical covariance and ellipsoid in the local orthonormal km
+        # frame. For a cartesian grid s == (1, 1, 1) and these are
+        # identical to the raw-coordinate versions.
+        dev_km = (dev0 if center == "solution" else dev) * s
+        cov_km = (w[:, None] * dev_km).T @ dev_km
+        dev_mean_km = dev * s
+        cov_mean_km = (w[:, None] * dev_mean_km).T @ dev_mean_km
+        evals_km, evecs_km = np.linalg.eigh(cov_km)
+        order = np.argsort(evals_km)[::-1]
+        evals_km, evecs_km = evals_km[order], evecs_km[:, order]
+        semi_km = np.sqrt(np.clip(evals_km, 0, None))
 
         evals, evecs = np.linalg.eigh(cov_post)
         order = np.argsort(evals)[::-1]
         evals, evecs = evals[order], evecs[:, order]
         semi_axes = np.sqrt(np.clip(evals, 0, None))
+
+        # Is the posterior actually bounded by the data, or by the search
+        # box? On geometry with no depth resolution the EDT surface is flat
+        # across the entire search volume, and then the reported sigma
+        # measures the box we chose rather than anything the arrivals
+        # constrain -- widen the box and sigma grows with it. This is not
+        # something a sampler can fix, and inflating the ellipsoid would
+        # only disguise it, so it is surfaced as a flag instead. NLL has
+        # the same property: its pdf is likewise truncated by LOCGRID.
+        # Measured against the ORIGINAL search volume, not against `delta`.
+        # Callers routinely contract the proposal to a few sigma before the
+        # final pass, and comparing sigma with a box that was constructed
+        # to be ~4 sigma wide flags every event as box-limited. Pass
+        # search_delta=<the original half-widths> to get a meaningful
+        # answer; it defaults to delta for callers that do not contract.
+        _sd = delta if search_delta is None else np.abs(
+            np.asarray(search_delta, dtype=np.float64)[:3]
+        )
+        box_fill = np.sqrt(np.clip(np.diag(cov_km), 0, None)) / np.maximum(
+            np.abs(_sd) * s, 1e-9
+        )
+        box_limited = bool(np.any(box_fill > 0.25))
+
+        # ---- origin time: promote the posterior to four dimensions -------
+        #
+        # The EDT likelihood is origin-time independent by construction, so
+        # the SPATIAL posterior above already marginalises over t0 and none
+        # of the numbers change by adding it. What t0 buys is the two
+        # things that were previously simply not reported: an uncertainty
+        # on the origin time itself, and its covariance with depth. On a
+        # network without a near-source station those two trade off almost
+        # completely -- a deeper origin with an earlier t0 fits the same
+        # arrivals -- and the correlation coefficient is the honest way to
+        # say so. It also lets a downstream consumer propagate the origin
+        # time properly instead of assuming it is exact.
+        #
+        # t0 at each sample is the same estimator origin_time() uses, so
+        # the marginal is consistent with the reported hypocenter.
+        time_solution = time_sigma = np.nan
+        cov4 = None
+        depth_time_corr = np.nan
+        if include_time:
+            t0s = np.empty(len(samples), dtype=np.float64)
+            for _i in range(len(samples)):
+                t0s[_i] = self.origin_time(
+                    np.ascontiguousarray(samples[_i], dtype=np.float64)
+                )
+            _finite = np.isfinite(t0s)
+            if _finite.sum() >= 4:
+                t0_solution = self.origin_time(
+                    np.ascontiguousarray(hypocenter, dtype=np.float64)
+                )
+                _w4 = w[_finite] / w[_finite].sum()
+                _s4 = samples[_finite]
+                _t4 = t0s[_finite]
+                if center == "solution" and np.isfinite(t0_solution):
+                    _c3 = np.asarray(hypocenter, dtype=np.float64)
+                    _ct = t0_solution
+                else:
+                    _c3 = _w4 @ _s4
+                    _ct = float(_w4 @ _t4)
+                _d4 = np.column_stack([(_s4 - _c3) * s, _t4 - _ct])
+                cov4 = (_w4[:, None] * _d4).T @ _d4
+                time_solution = (
+                    t0_solution if np.isfinite(t0_solution)
+                    else float(_w4 @ _t4)
+                )
+                time_sigma = float(np.sqrt(max(cov4[3, 3], 0.0)))
+                # correlation between the vertical axis and origin time.
+                # Axis 0 is r (up) for spherical grids, axis 2 is z for
+                # cartesian; both are the vertical one.
+                _iz = 0 if self.cy_coord_sys != "cartesian" else 2
+                _den = math_sqrt(max(cov4[_iz, _iz], 0.0)) * time_sigma
+                if _den > 0:
+                    depth_time_corr = float(cov4[_iz, 3] / _den)
+
+        # Monte Carlo standard error on the reported sigma, as a FRACTION
+        # of sigma. Importance-sampling variance estimates have relative
+        # error ~1/sqrt(2*ESS), so at ESS=80 the sigma is only good to
+        # about 8% -- worth knowing before treating a change of that size
+        # as real.
+        sigma_rel_mcse = float(1.0 / np.sqrt(2.0 * max(ess, 1.0)))
 
         scatter_idx = rng.choice(len(samples), size=int(nscatter), p=w)
         scatter = samples[scatter_idx]
@@ -937,9 +1438,32 @@ cdef class EQLocator(object):
             "scatter": scatter,
             "mean": mean,
             "covariance": cov_post,
+            "covariance_km": cov_km,
+            "covariance_km_about_mean": cov_mean_km,
+            "center": center,
+            "mode_minus_mean_km": (
+                np.asarray(hypocenter, dtype=np.float64) - mean
+            ) * s,
             "ellipsoid": {"semi_axes": semi_axes, "axes": evecs.T},
+            "ellipsoid_km": {
+                "semi_axes": semi_km,
+                "axes": evecs_km.T,
+                "volume_km3": float(4.0 / 3.0 * np.pi * np.prod(semi_km)),
+            },
+            "metric_scale": s,
             "ess": ess,
             "proposal": used,
+            "time": time_solution,
+            "time_sigma": time_sigma,
+            "covariance4_km_s": cov4,
+            "depth_time_correlation": depth_time_corr,
+            "sigma_rel_mcse": sigma_rel_mcse,
+            "box_limited": box_limited,
+            "box_fill": box_fill,
+            "at_search_edge": np.asarray(
+                self.cy_edge_axes if self.cy_edge_axes is not None
+                else np.zeros(3, dtype=bool)
+            ),
         }
 
 

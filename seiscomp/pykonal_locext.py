@@ -31,6 +31,7 @@ import math
 import os
 import sys
 import tempfile
+from statistics import NormalDist
 import traceback
 
 import numpy as np
@@ -84,6 +85,29 @@ def gc_distance_azimuth(lat1, lon1, lat2, lon2):
         - math.sin(p1) * math.cos(p2) * math.cos(dlon)
     )) % 360.0
     return dist, az
+
+
+def chi_scale(percent, dof):
+    """Number of sigmas enclosing `percent` of a `dof`-dimensional Gaussian.
+
+    dof=3 for the confidence ellipsoid, 2 for the horizontal ellipse, 1 for
+    a single marginal (latitude, longitude, depth). These differ a lot:
+    at 68% they are 1.878, 1.515 and 1.000 respectively, so quoting a
+    1-sigma semi-axis as a "68% ellipsoid" understates it by ~47%.
+
+    Exact for dof 1 and 2; Wilson-Hilferty for dof 3 (error < 0.5% over the
+    range of levels anyone reports). No scipy dependency.
+    """
+    p = min(max(percent / 100.0, 1e-6), 1.0 - 1e-9)
+    nd = NormalDist()
+    if dof == 1:
+        return nd.inv_cdf(0.5 * (1.0 + p))
+    if dof == 2:
+        return math.sqrt(-2.0 * math.log(1.0 - p))
+    z = nd.inv_cdf(p)
+    return math.sqrt(
+        dof * (1.0 - 2.0 / (9.0 * dof) + z * math.sqrt(2.0 / (9.0 * dof))) ** 3
+    )
 
 
 def log(msg):
@@ -643,6 +667,13 @@ def main():
     # independent draws each time (e.g. to gauge sampling variability).
     _pseed = cfg.get("posterior_seed", 4321)
     posterior_seed = None if _pseed is None else int(_pseed)
+    # Confidence level (percent) for the reported ellipsoid and
+    # uncertainties. 68 matches NonLinLoc, whose confidence ellipsoid is
+    # the 68% THREE-DIMENSIONAL region -- 1.878 sigma, not 1 sigma. Earlier
+    # versions of this plugin emitted bare 1-sigma semi-axes while calling
+    # them a confidence ellipsoid, which made pykonal ellipsoids look about
+    # half the linear size of NLL ellipsoids for an identical posterior.
+    confidence_level = float(cfg.get("confidence_level", 68.0))
 
     stations = {}
     if cfg.get("stations_csv"):
@@ -719,6 +750,10 @@ def main():
             for a in arrivals_in
         )).encode()
     ).hexdigest()[:8]
+    # Event boundary marker. A run interleaves many events in one stderr
+    # stream, so this gives a single unambiguous line to search or split on
+    # without altering the content lines below it.
+    log("=" * 60)
     log(f"input: initial=({lat0:.4f}, {lon0:.4f}, dep {dep0:.1f} km), "
         f"{len(arrivals_in)} arrivals, fingerprint={_afp}, "
         f"ignore_initial={args.ignore_initial_location}, "
@@ -1021,9 +1056,17 @@ def main():
          EQLocator(inventory_path,
                    coord_sys=transform.coord_sys) as locator:
         locator.default_pick_error = default_pick_error
-        # edt_reg is the one optional EDT knob (opt-in; 0 = pure EDT).
-        if hasattr(locator, "edt_reg") and "edt_reg" in cfg:
-            locator.edt_reg = float(cfg["edt_reg"])
+        # EDT_OT_WT (NonLinLoc LOCMETH EDT_OT_WT): penalise the pdf by the
+        # spread of the per-arrival origin-time estimates. On by default.
+        if hasattr(locator, "edt_ot_wt"):
+            locator.edt_ot_wt = bool(cfg.get("edt_ot_wt", True))
+        # Exponent on the EDT stack; null/absent = arrival count, as in NLL.
+        if hasattr(locator, "edt_exponent") and cfg.get("edt_exponent") is not None:
+            locator.edt_exponent = float(cfg["edt_exponent"])
+        if "edt_reg" in cfg:
+            log("NOTE: edt_reg has been removed; it is ignored. EDT_OT_WT "
+                "(edt_ot_wt) does the same job without the outlier "
+                "sensitivity. You can delete the key from your config.")
         # Optionally solve using only the N geographically-closest arrivals,
         # while still reporting residuals for ALL of them. Distant arrivals
         # in a 1D model carry systematic Pn/model error that can drag the
@@ -1142,6 +1185,19 @@ def main():
                     f"{', '.join('.'.join(k) for k in _excluded)}")
 
         quality = locator.quality(soln)
+
+        # Grid-axis index mapping, defined ONCE here because it is used both
+        # by the box-limited warning during sampling and by the uncertainty
+        # reporting further down. It used to be defined only at the second
+        # of those, which raised
+        #   "cannot access local variable '_ilat'"
+        # from the warning path -- i.e. exactly on the events the warning
+        # exists to flag.
+        if transform.spatial_axes_are_xyz_enu():
+            _ilon, _ilat, _iz = 0, 1, 2          # cartesian (E, N, z)
+        else:
+            _ilon, _ilat, _iz = 2, 1, 0          # spherical (r, theta, phi)
+
         posterior = None
         if method == "edt" and nsamples > 0:
             try:
@@ -1168,7 +1224,8 @@ def main():
                 for _pass in range(6):
                     posterior = locator.sample_posterior(
                         soln[:3], _d, nsamples=nsamples, nscatter=0,
-                        seed=posterior_seed
+                        seed=posterior_seed,
+                        search_delta=np.asarray(delta[:3], dtype=float)
                     )
                     _sig = np.sqrt(np.clip(
                         np.diag(posterior["covariance"]), 0, None))
@@ -1176,6 +1233,66 @@ def main():
                     if np.all(_next > 0.95 * _d):
                         break            # converged: proposal already tight
                     _d = _next
+                if posterior.get("box_limited"):
+                    # A diagnostic must never be able to take down a
+                    # location. This one previously did, via an
+                    # undefined name, and it failed on precisely the
+                    # events it was meant to describe.
+                    try:
+                        # box_fill is a dimensionless ratio, sigma / search
+                        # half-width, per axis. It is in GRID axis order, which
+                        # is NOT the order of search_delta_km -- report it
+                        # named, in km, and in config order instead of making
+                        # the operator work that out.
+                        _bf = np.asarray(posterior.get("box_fill", []), dtype=float)
+                        _half = np.abs(np.asarray(delta[:3], dtype=float)) * (
+                            posterior.get("metric_scale", np.ones(3))
+                        )
+                        # grid axis -> (label, index into search_delta_km)
+                        _axmap = [(_ilat, "north-south", 0),
+                                  (_ilon, "east-west", 1),
+                                  (_iz, "depth", 2)]
+                        _parts, _rec = [], [0.0, 0.0, 0.0]
+                        for _g, _lab, _c in _axmap:
+                            _s_km = _bf[_g] * _half[_g]
+                            _parts.append(
+                                f"{_lab} sigma {_s_km:.1f} km vs half-width "
+                                f"{_half[_g]:.0f} km (ratio {_bf[_g]:.2f})"
+                            )
+                            # target ratio 0.25, i.e. half-width >= 4 sigma
+                            _rec[_c] = float(_half[_g] * max(1.0, _bf[_g] / 0.25))
+                        log("WARNING: posterior is limited by the search box, not "
+                            "by the arrivals: " + "; ".join(_parts) + ". A ratio "
+                            "above 0.25 means the search half-width is less than "
+                            "4 sigma, so the pdf is truncated at the box edge and "
+                            "the reported uncertainty is a LOWER BOUND. Try "
+                            "search_delta_km = ["
+                            + ", ".join(f"{v:.0f}" for v in _rec) + "]. "
+                            "If the ratios stay high after widening, the geometry "
+                            "genuinely does not constrain that axis -- commonly "
+                            "depth, with no near-source station -- and the box "
+                            "cannot fix that. Widening also costs search "
+                            "quality: the same sample budget covers more volume, "
+                            "so raise posterior_nsamples with it, and keep the "
+                            "box inside your traveltime grids and any "
+                            "depth_min/depth_max clamp.")
+                    except Exception as _e:
+                        log(f"(box-limited diagnostic unavailable: {_e})")
+                _corr = posterior.get("depth_time_correlation")
+                if _corr is not None and np.isfinite(_corr) and abs(_corr) > 0.9:
+                    log(f"depth and origin time are correlated at "
+                        f"{_corr:+.2f}: they trade off almost completely, so "
+                        f"neither is independently determined. Depth is only "
+                        f"as good as the origin time here.")
+                _mcse = posterior.get("sigma_rel_mcse")
+                if _mcse is not None and np.isfinite(_mcse) and _mcse > 0.15:
+                    log(f"sigma has a Monte Carlo standard error of "
+                        f"{100*_mcse:.0f}% -- raise posterior_nsamples if you "
+                        f"need the uncertainty itself to be precise")
+                _prop = str(posterior.get("proposal", "unknown"))
+                if "fallback" in _prop:
+                    log(f"posterior: curvature-based proposal unusable, fell "
+                        f"back to {_prop}; uncertainties are less reliable")
                 _ess = float(posterior.get("ess", float("nan")))
                 if _ess < 50:
                     log(f"posterior: effective sample size {_ess:.0f} of "
@@ -1191,22 +1308,38 @@ def main():
         lat, lon, dep = transform.grid_to_geo(soln[:3])
         t0 = seiscomp.core.Time(epoch) + seiscomp.core.TimeSpan(float(soln[3]))
 
-        # 1-sigma uncertainties in km from the EDT posterior covariance,
-        # computed here so they can be reported inline with the solution
-        # and reused below when populating the origin. None if no posterior.
+        # Uncertainties in km from the EDT posterior covariance, at the
+        # configured confidence level, computed here so they can be reported
+        # inline with the solution and reused below when populating the
+        # origin. None if no posterior.
+        # The library now reports covariance_km: the posterior covariance
+        # already expressed in km^2 in the local orthonormal frame
+        # (up, south, east for spherical grids; xyz for cartesian). Prefer
+        # it. The fallback path reproduces the old hand-rolled scaling so
+        # this script still runs against a pykonal that has not been
+        # rebuilt -- but note that only the fallback's per-axis sigmas were
+        # ever correct; its ellipsoid was an eigendecomposition of a matrix
+        # mixing km with radians.
         lat_km = lon_km = dz = None
+        cov_km = None
         if posterior is not None:
-            _cov = posterior["covariance"]
-            if transform.spatial_axes_are_xyz_enu():
-                lon_km = math.sqrt(max(_cov[0, 0], 0.0))
-                lat_km = math.sqrt(max(_cov[1, 1], 0.0))
-                dz     = math.sqrt(max(_cov[2, 2], 0.0))
-            else:
-                _r0 = pk_constants.EARTH_RADIUS - dep
-                _theta = math.radians(90.0 - lat)
-                lat_km = math.sqrt(max(_cov[1, 1], 0.0)) * _r0
-                lon_km = math.sqrt(max(_cov[2, 2], 0.0)) * _r0 * math.sin(_theta)
-                dz     = math.sqrt(max(_cov[0, 0], 0.0))
+            cov_km = posterior.get("covariance_km")
+            if cov_km is None:
+                _cov = posterior["covariance"]
+                if transform.spatial_axes_are_xyz_enu():
+                    _s = np.ones(3)
+                else:
+                    _r0 = pk_constants.EARTH_RADIUS - dep
+                    _s = np.array([1.0, _r0,
+                                   _r0 * math.sin(math.radians(90.0 - lat))])
+                cov_km = np.asarray(_cov) * np.outer(_s, _s)
+            cov_km = np.asarray(cov_km, dtype=float)
+            # _ilon / _ilat / _iz are set above, before posterior sampling.
+            # marginal (1-dof) uncertainties at the requested level
+            _k1 = chi_scale(confidence_level, 1)
+            lat_km = _k1 * math.sqrt(max(cov_km[_ilat, _ilat], 0.0))
+            lon_km = _k1 * math.sqrt(max(cov_km[_ilon, _ilon], 0.0))
+            dz     = _k1 * math.sqrt(max(cov_km[_iz, _iz], 0.0))
 
     if lat_km is not None:
         _ess_txt = ""
@@ -1214,9 +1347,17 @@ def main():
             _ess_txt = f" ess={float(posterior['ess']):.0f}"
         except Exception:
             pass
+        _t_txt = ""
+        try:
+            _ts = float(posterior["time_sigma"])
+            if np.isfinite(_ts):
+                _t_txt = f", t0 \u00b1{_ts:.2f} s"
+        except Exception:
+            pass
         _unc = (f"lat {lat:.4f}\u00b0 \u00b1{lat_km:.2f} km, "
                 f"lon {lon:.4f}\u00b0 \u00b1{lon_km:.2f} km, "
-                f"depth {dep:.1f} \u00b1{dz:.2f} km{_ess_txt}")
+                f"depth {dep:.1f} \u00b1{dz:.2f} km{_t_txt} "
+                f"({confidence_level:.0f}% marginal){_ess_txt}")
     else:
         _unc = (f"lat {lat:.4f}\u00b0, lon {lon:.4f}\u00b0, "
                 f"depth {dep:.1f} km (uncertainties not estimated)")
@@ -1276,7 +1417,20 @@ def main():
     origin.setLatitude(seiscomp.datamodel.RealQuantity(lat))
     origin.setLongitude(seiscomp.datamodel.RealQuantity(lon))
     origin.setDepth(seiscomp.datamodel.RealQuantity(dep))
-    origin.setTime(seiscomp.datamodel.TimeQuantity(t0))
+    # Origin time, with its uncertainty when the posterior supplied one.
+    # Previously the time was emitted bare, implying an exactness it never
+    # had -- on geometry without a near-source station the origin time
+    # trades off almost completely against depth (see the correlation
+    # logged above) and can be uncertain by seconds.
+    _tq = seiscomp.datamodel.TimeQuantity(t0)
+    if posterior is not None:
+        _ts = posterior.get("time_sigma")
+        if _ts is not None and np.isfinite(_ts):
+            try:
+                _tq.setUncertainty(float(_ts))
+            except Exception:
+                pass
+    origin.setTime(_tq)
     origin.setMethodID(f"pykonal-{method.upper()}")
     origin.setEarthModelID(cfg.get("earth_model_id", "pykonal"))
     _set_enum(origin.setEvaluationMode,
@@ -1341,8 +1495,28 @@ def main():
 
     # uncertainty ellipsoid from the EDT posterior
     if posterior is not None:
-        semi = posterior["ellipsoid"]["semi_axes"] * 1000.0  # km -> m
-        axes = posterior["ellipsoid"]["axes"]
+        # ellipsoid_km is the eigendecomposition of the km-frame covariance:
+        # physically meaningful semi-axis lengths and genuinely orthonormal
+        # principal axes. The legacy "ellipsoid" key is an eigendecomposition
+        # of the RAW grid covariance, whose entries on a spherical grid are a
+        # mixture of km^2, km*rad and rad^2 -- its semi-axes were not lengths
+        # and its eigenvectors were not directions. Fall back to recomputing
+        # from cov_km if running against an older library build.
+        _ell_km = posterior.get("ellipsoid_km")
+        if _ell_km is not None:
+            semi_km = np.asarray(_ell_km["semi_axes"], dtype=float)
+            axes = np.asarray(_ell_km["axes"], dtype=float)
+        else:
+            _ev, _evec = np.linalg.eigh(cov_km)
+            _order = np.argsort(_ev)[::-1]
+            semi_km = np.sqrt(np.clip(_ev[_order], 0.0, None))
+            axes = _evec[:, _order].T
+
+        # Scale 1-sigma to the requested confidence level. The ellipsoid is a
+        # 3-D region, so the chi-square quantile with 3 degrees of freedom is
+        # the right factor (1.878 at 68%), matching NonLinLoc.
+        _k3 = chi_scale(confidence_level, 3)
+        semi = semi_km * _k3 * 1000.0  # km -> m
 
         ce = seiscomp.datamodel.ConfidenceEllipsoid()
         ce.setSemiMajorAxisLength(float(semi[0]))
@@ -1363,6 +1537,13 @@ def main():
 
         ou = seiscomp.datamodel.OriginUncertainty()
         ou.setConfidenceEllipsoid(ce)
+        # State the level explicitly. Without it a consumer cannot tell a
+        # 1-sigma ellipsoid from a 68% or 95% one, and they differ by
+        # factors of 1.88 and 2.80 respectively.
+        try:
+            ou.setConfidenceLevel(float(confidence_level))
+        except Exception:
+            pass
         # The enum constant for "confidence ellipsoid" varies by seiscomp
         # version, and a module attribute of the right NAME may belong to a
         # different enum (setter then rejects it as "out of range"). So we
@@ -1378,18 +1559,22 @@ def main():
             "OU_CONFIDENCE_ELLIPSOID",
             "OriginUncertaintyDescription_CONFIDENCE_ELLIPSOID",
         )
-        # Per-coordinate 1-sigma uncertainties in KM (SeisComP convention
-        # for lat/lon/depth uncertainty is kilometers, not degrees). These
+        # Per-coordinate uncertainties in KM (SeisComP's convention for
+        # lat/lon/depth uncertainty is kilometers, not degrees). These
         # populate origin.latitude/longitude/depth .uncertainty(), which is
-        # what scolv's location view displays. Axis mapping of the
-        # posterior covariance:
-        #   cartesian (E, N, depth): cov[0]=lon(E), cov[1]=lat(N), cov[2]=z
-        #   spherical (r, theta, phi): cov[0]=depth(r),
-        #       cov[1]=theta->lat, cov[2]=phi->lon (scaled by Earth radius,
-        #       and by sin(theta) for the east-west metric)
-        # lat_km / lon_km / dz were computed inline with the solution above
-        # horizontalUncertainty (km): the larger horizontal 1-sigma
-        ou.setHorizontalUncertainty(float(max(lat_km, lon_km)))
+        # what scolv's location view displays. They are MARGINAL (1-dof)
+        # intervals at `confidence_level`, so at the 68% default they are
+        # very nearly plain 1-sigma; the ellipsoid above is the 3-dof
+        # region at the same level and is correspondingly wider. Computed
+        # inline with the solution above from covariance_km.
+        # horizontalUncertainty (km): the semi-major axis of the HORIZONTAL
+        # marginal ellipse at the requested level -- not max(lat, lon). When
+        # the horizontal errors are correlated (routine for a one-sided
+        # network, where the ellipse is a long diagonal ridge) the true
+        # semi-major exceeds both marginal sigmas, sometimes by a lot.
+        _ch = cov_km[np.ix_([_ilon, _ilat], [_ilon, _ilat])]
+        _hmax = float(np.sqrt(max(np.linalg.eigvalsh(_ch)[-1], 0.0)))
+        ou.setHorizontalUncertainty(_hmax * chi_scale(confidence_level, 2))
         origin.setUncertainty(ou)
 
         # latitude / longitude uncertainties (km) — mirror what we do for

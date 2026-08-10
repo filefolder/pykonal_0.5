@@ -19,7 +19,8 @@ cdef class EQLocator(object):
     cdef dict                    cy_pick_errors
     cdef constants.REAL_t        cy_default_pick_error
     cdef constants.REAL_t        cy_edt_exponent
-    cdef constants.REAL_t        cy_edt_reg
+    cdef constants.BOOL_t        cy_edt_ot_wt
+    cdef constants.REAL_t        cy_edt_ot_wt_floor
     cdef object                  cy_locate_seed
     # flattened per-arrival workspace (rebuilt by _prepare_workspace)
     cdef list                    cy_keys
@@ -27,6 +28,8 @@ cdef class EQLocator(object):
     cdef constants.REAL_t[:]     cy_obs
     cdef constants.REAL_t[:]     cy_sigma
     cdef constants.REAL_t[:]     cy_tt_work
+    cdef constants.REAL_t[:]     cy_ot_work
+    cdef object                  cy_edge_axes
 
     cpdef constants.BOOL_t add_arrivals(EQLocator self, dict arrivals)
     cpdef constants.BOOL_t add_residual_rvs(EQLocator self, dict residua_rvs)
@@ -47,6 +50,7 @@ cdef class EQLocator(object):
     cpdef constants.BOOL_t add_pick_errors(EQLocator self, dict pick_errors)
     cpdef constants.BOOL_t _prepare_workspace(EQLocator self)
     cdef int _fill_traveltimes(EQLocator self, constants.REAL_t[:] hypo_xyz)
+    cdef constants.REAL_t _effective_exponent(EQLocator self, int n)
     cpdef constants.REAL_t edt_log_likelihood(
         EQLocator self,
         constants.REAL_t[:] hypo_xyz
