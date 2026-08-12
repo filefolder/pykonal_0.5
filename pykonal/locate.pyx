@@ -835,12 +835,13 @@ cdef class EQLocator(object):
         if method == "edt":
             return self._locate_edt(initial, min_coords, max_coords)
 
+        # the below is for the L1 solver only
+
         bounds = np.stack([min_coords, max_coords]).T
 
-        # RCP added some kwargs
         soln = scipy.optimize.differential_evolution(self.rms, bounds,
-                                                     x0 = initial, # recent scipy allows an initial estimate 
-                                                     strategy='best1bin', updating='immediate', 
+                                                     x0 = initial,
+                                                     strategy='best1bin', updating='immediate',
                                                      maxiter=200, mutation=(0.3,1.0), recombination=0.7,
                                                      popsize=20, atol=0.01, tol=0.01, init='sobol',
                                                      seed=self.cy_locate_seed,
@@ -851,6 +852,7 @@ cdef class EQLocator(object):
         polished = scipy.optimize.minimize(
             self.rms, soln.x,
             method='Nelder-Mead',
+            bounds=bounds, # added bounds
             options={
                 'xatol': 0.05,    # 50 m / 50 ms — tighter than DE could give
                 'fatol': 0.005,   # 5 ms RMS resolution
@@ -859,12 +861,6 @@ cdef class EQLocator(object):
         )
 
         final_x = polished.x if polished.fun < soln.fun else soln.x
-
-        # so the solution is the minium rms in the DE cloud (shape (4,) x,y,z,t)
-        # we could at some point accept/reject based on this - send to pyvorotomo to boot events
-        # final_rms = min(polished.fun, soln.fun)
-        # soln_std = np.std(soln.population, axis=0) # n.b. this is pre-polish
-        # return final_x,final_rms,soln_std
 
         return final_x
 
