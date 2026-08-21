@@ -384,8 +384,8 @@ def build_velocity_field(F, regime: Regime, phase, nr, ntheta, nphi):
 
     vf = F.ScalarField3D(coord_sys="spherical")
     vf.min_coords = np.array([r_min, th_min, ph_min], dtype=np.float64)
-    vf.node_intervals = np.array([dr, dth, dph], dtype=np.float64)
     vf.npts = np.array([nr, ntheta, nphi], dtype=np.int64)
+    vf.node_intervals = np.array([dr, dth, dph], dtype=np.float64)
 
     r_nodes = r_min + np.arange(nr) * dr
     depth = R_EARTH - r_nodes

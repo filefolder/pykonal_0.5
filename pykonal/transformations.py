@@ -13,8 +13,26 @@ import numpy as np
 
 from . import constants
 
-
+# this is more accurate, but requires a rebuild of our models / TODO
 def geo2sph(nodes):
+    """
+    Transform geographical coordinates to new spherical coordinates system.
+
+    Latitude is GEODETIC (the WGS84 convention that station files, SeisComP
+    inventories and QuakeML all use); colatitude on the grid is GEOCENTRIC.
+    Treating them as the same quantity is a latitude-dependent shift of up
+    to 0.192 deg -- 21.4 km on the ground at 45 deg -- so the conversion is
+    applied here rather than left to callers.
+    """
+    geo = np.array(nodes, dtype=constants.DTYPE_REAL)
+    sph = np.empty_like(geo)
+    lat_gc = np.arctan((1.0 - constants.WGS84_E2) * np.tan(np.radians(geo[..., 0])))
+    sph[..., 0] = constants.EARTH_RADIUS - geo[..., 2]
+    sph[..., 1] = np.pi / 2 - lat_gc
+    sph[..., 2] = np.radians(geo[..., 1])
+    return sph
+
+def geo2sph_OLD(nodes):
     """
     Transform geographical coordinates to new spherical coordinates system.
     """
@@ -23,7 +41,7 @@ def geo2sph(nodes):
     sph[..., 0] = constants.EARTH_RADIUS - geo[..., 2]
     sph[..., 1] = np.pi / 2 - np.radians(geo[..., 0])
     sph[..., 2] = np.radians(geo[..., 1])
-    return (sph)
+    return sph
 
 
 def sph2sph(nodes, origin=(0,0,0), force_phi_positive=False):
@@ -59,7 +77,7 @@ def sph2sph(nodes, origin=(0,0,0), force_phi_positive=False):
     if force_phi_positive is False:
         np.mod(pp, -np.pi, pp, where=pp>np.pi)
     rtp = np.moveaxis(np.stack([rr, tt, pp]), 0, -1)
-    return (rtp)
+    return rtp
 
 
 def xyz2sph(nodes, origin=(0,0,0), force_phi_positive=False):
@@ -84,10 +102,27 @@ def xyz2sph(nodes, origin=(0,0,0), force_phi_positive=False):
     if force_phi_positive:
         pp = np.mod(pp, 2*np.pi)
     rtp = np.moveaxis(np.stack([rr, tt, pp]), 0, -1)
-    return (rtp)
+    return rtp
 
 
+# this is more accurate, but requires a rebuild of our models / TODO
 def sph2geo(nodes):
+    """
+    Transform spherical coordinates to new geographical coordinate system.
+
+    Inverse of geo2sph: grid colatitude is geocentric, returned latitude is
+    geodetic.
+    """
+    sph = np.array(nodes, dtype=constants.DTYPE_REAL)
+    geo = np.empty_like(sph)
+    lat_gc = np.pi / 2 - sph[..., 1]
+    geo[..., 0] = np.degrees(np.arctan(np.tan(lat_gc) / (1.0 - constants.WGS84_E2)))
+    geo[..., 1] = np.degrees(sph[..., 2])
+    geo[..., 2] = constants.EARTH_RADIUS - sph[..., 0]
+    return geo
+
+
+def sph2geo_OLD(nodes):
     """
     Transform spherical coordinates to new geographical coordinate system.
     """
@@ -96,7 +131,7 @@ def sph2geo(nodes):
     geo[..., 0] = np.degrees(np.pi / 2 - sph[..., 1])
     geo[..., 1] = np.degrees(sph[..., 2])
     geo[..., 2] = constants.EARTH_RADIUS - sph[..., 0]
-    return (geo)
+    return geo
 
 
 def sph2xyz(nodes, origin=(0,0,0)):
@@ -124,7 +159,7 @@ def sph2xyz(nodes, origin=(0,0,0)):
     yy -= origin[1]
     zz -= origin[2]
     xyz = np.moveaxis(np.stack([xx, yy, zz]), 0, -1)
-    return (xyz)
+    return xyz
 
 
 def xyz2xyz(nodes, origin=(0,0,0)):

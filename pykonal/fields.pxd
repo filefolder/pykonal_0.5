@@ -11,6 +11,8 @@ cdef class Field3D(object):
     cdef constants.REAL_t[3]       cy_max_coords
     cdef constants.REAL_t[3]       cy_min_coords
     cdef constants.REAL_t[:,:,:,:] cy_norm
+    cdef constants.REAL_t[:,:,:]   cy_norm_compact
+    cdef constants.BOOL_t          cy_norm_compact_isset
     cdef constants.UINT_t[3]       cy_npts
     cdef constants.REAL_t[3]       cy_node_intervals
 
@@ -22,6 +24,7 @@ cdef class Field3D(object):
     cdef constants.BOOL_t _update_max_coords(Field3D self)
     cdef constants.BOOL_t _update_iax_isnull(Field3D self)
     cdef constants.BOOL_t _update_iax_isperiodic(Field3D self)
+    cdef constants.REAL_t[:,:,:] _norm_compact(Field3D self)
 
     cpdef constants.BOOL_t to_hdf(
         Field3D self,
@@ -62,6 +65,11 @@ cdef class VectorField3D(Field3D):
         constants.REAL_t[:] point,
         constants.REAL_t null=*
     )
-
+    cdef void value_c(
+        VectorField3D self,
+        constants.REAL_t* point,
+        constants.REAL_t* out,
+        constants.REAL_t null
+    ) noexcept nogil
 
 cpdef Field3D load(str path)

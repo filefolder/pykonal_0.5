@@ -119,7 +119,7 @@ cdef class EikonalSolver(object):
     def norm(self):
         """
         .. deprecated:: 0.3.2
-           Use self.velocity.norm or self.traveltime.velocity instead.
+           Use self.velocity.norm (now cy_velocity._norm_compact) or self.traveltime.velocity instead.
 
         [*Read-only*, numpy.ndarray(shape=(N0,N1,N2,3), dtype=numpy.float)] 4D array of scaling
         factors for gradient operator.
@@ -229,7 +229,7 @@ cdef class EikonalSolver(object):
         cdef Py_ssize_t                           drop_iax
         cdef constants.REAL_t                     max_op
         cdef constants.REAL_t[:,:,:]              tt, vv
-        cdef constants.REAL_t[:,:,:,:]            norm
+        cdef constants.REAL_t[:,:,:]              norm
         cdef constants.BOOL_t[3]                  iax_isperiodic,
         cdef constants.BOOL_t[:,:,:]              known, unknown
         cdef heapq.Heap                           trial
@@ -243,7 +243,8 @@ cdef class EikonalSolver(object):
 
         tt = self.traveltime.values
         vv = self.velocity.values
-        norm = self.velocity.norm
+        #norm = self.velocity.norm
+        norm = self.cy_velocity._norm_compact()
         known = self.known
         unknown = self.unknown
         trial = self.trial
@@ -288,7 +289,7 @@ cdef class EikonalSolver(object):
                 if v_nbr > 0:
                     for iax in range(3):
 
-                        norm_iax = norm[nbr[0], nbr[1], nbr[2], iax]
+                        norm_iax = norm[nbr[0], nbr[1], iax]
                         if norm_iax == 0:
                             aa[iax], bb[iax], cc[iax] = 0, 0, 0
                             op_tt[iax] = -1.0  # axis inactive

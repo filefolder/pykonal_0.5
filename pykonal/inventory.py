@@ -501,8 +501,9 @@ def ensure_traveltimes(path, requests, velocity_models, max_dist=None,
     # ---- phase 1: what is missing? (shared lock, read-only) ----
     missing = dict(requests)
     if os.path.exists(path):
-        with open(path + ".lock", "w") as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_SH)
+        fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
             try:
                 with TraveltimeInventory(path, mode="r") as inv:
                     for key in requests:
@@ -510,7 +511,9 @@ def ensure_traveltimes(path, requests, velocity_models, max_dist=None,
                             result["present"].append(key)
                             missing.pop(key)
             finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
     if not missing:
         return result
 
@@ -558,10 +561,11 @@ def ensure_traveltimes(path, requests, velocity_models, max_dist=None,
 
     # ---- phase 3: write under exclusive lock, re-checking ----
     coords_by_key = {key: coords for key, coords, _, _ in tasks}
-    with open(path + ".lock", "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        mode = "a" if os.path.exists(path) else "w"
         try:
-            mode = "a" if os.path.exists(path) else "w"
             with TraveltimeInventory(path, mode=mode) as inv:
                 for key, data in solved:
                     if inv.has(key):     # a racing process wrote it first
@@ -580,6 +584,9 @@ def ensure_traveltimes(path, requests, velocity_models, max_dist=None,
                     result["computed"].append(key)
                 inv.f5.flush()
         finally:
-            fcntl.flock(lockf, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
     return result
+

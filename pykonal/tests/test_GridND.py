@@ -101,18 +101,31 @@ class GridGeometryTestCase(unittest.TestCase):
             self.assertTrue(np.all(field.npts >= 1))
 
     def test_npts_overflow(self):
-        """The real npts limit is uint16, not the advertised uint32.
+        """npts is uint32, matching DTYPE_UINT; values above 2**32-1 wrap."""
+        field = pykonal.fields.ScalarField3D(coord_sys="cartesian")
+        field.min_coords = np.array([0., 0., 0.])
+        field.node_intervals = np.array([1., 1., 1.])
 
-        Documented by test rather than left to be discovered: an axis of
-        more than 65535 nodes raises OverflowError from the C assignment.
-        It fails loudly rather than wrapping, which is the right
-        behaviour, but it is not what `DTYPE_UINT = np.uint32` implies.
+        # 65536 used to wrap to 0 because UINT_t was uint16 while
+        # DTYPE_UINT advertised uint32. It must round-trip now.
+        field.npts = np.array([65536, 1, 1])
+        self.assertEqual(field.npts[0], 65536)
+
+        field.npts = np.array([2**32 - 1, 1, 1])
+        self.assertEqual(field.npts[0], 2**32 - 1)
+
+    def test_max_coords_with_npts_unset(self):
+        """node_intervals may be set before npts (read_hdf does this).
+
+        cy_npts is unsigned, so (npts - 1) must be evaluated in signed
+        arithmetic -- otherwise 0 - 1 wraps to 4294967295 and max_coords
+        blows up to +4.3e9 * node_interval, tripping the spherical phi
+        bounds check on every field.
         """
-        field = ScalarField3D(coord_sys="cartesian")
-        field.min_coords = 0, 0, 0
-        field.node_intervals = 1, 1, 1
-        with self.assertRaises(OverflowError):
-            field.npts = 70000, 4, 4
+        field = pykonal.fields.ScalarField3D(coord_sys="cartesian")
+        field.min_coords = np.array([0., 0., 0.])
+        field.node_intervals = np.array([1., 1., 1.])   # npts still 0
+        np.testing.assert_array_equal(field.max_coords, [-1., -1., -1.])
 
     def test_max_coords_tracks_npts(self):
         """Replaces the old npts-validation assertions.

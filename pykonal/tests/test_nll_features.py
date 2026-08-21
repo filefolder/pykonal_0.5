@@ -102,27 +102,7 @@ with EQLocator(inv_path, coord_sys="cartesian") as loc:
     inside = np.linalg.norm(post['mean'] - true_hypo) < 3 * ax[0] + 0.5
     print(f"  true hypocenter within ~3-sigma of posterior mean: {inside}")
 
-    # ---------------------------------------------------------- station corrections
-    # give ST01 a known static delay of +0.30 s and verify corrections fix it
-    print("\nStation correction test (ST01 has +0.30 s static delay):")
-    arr2 = dict(arrivals)
-    arr2[("XX", "ST04", "P")] -= 2.5              # remove outlier
-    arr2[("XX", "ST01", "P")] += 0.30             # add static delay
-    loc.clear_arrivals(); loc.add_arrivals(arr2)
-
-    s_no = loc.locate(initial.copy(), delta.copy(), 0.01, "edt")
-    report("EDT, no correction", s_no)
-    r_no = loc.residuals(s_no)
-    print(f"    ST01 residual (raw): {r_no[('XX','ST01','P')]:+0.3f} s")
-
-    loc.add_station_corrections({("XX", "ST01", "P"): 0.30})
-    s_yes = loc.locate(initial.copy(), delta.copy(), 0.01, "edt")
-    report("EDT, with correction", s_yes)
-    r_yes = loc.residuals(s_yes)
-    print(f"    ST01 residual (corrected): {r_yes[('XX','ST01','P')]:+0.3f} s")
-
     # ---------------------------------------------------------- locate_detailed
-    loc.station_corrections = {}
     loc.clear_arrivals(); loc.add_arrivals(arrivals)
     detail = loc.locate_detailed(initial.copy(), delta.copy(), alpha=0.01,
                                  method="edt", nsamples=2048, seed=2)

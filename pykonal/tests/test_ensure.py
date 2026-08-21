@@ -7,6 +7,8 @@ from pykonal import fields
 vm = fields.ScalarField3D(coord_sys="cartesian")
 vm.min_coords = (0, 0, 0); vm.node_intervals = (2, 2, 2); vm.npts = (101, 101, 26)
 vm.values = np.full((101, 101, 26), 5.0)
+if os.path.isfile("./data/vp.h5"):
+    os.system("rm ./data/vp.h5")
 vm.to_hdf("./data/vp.h5")
 
 stations = {("XX", "A"): (40., 40., 0.), ("XX", "B"): (160., 40., 0.),
@@ -46,7 +48,7 @@ print(f"1. missing-grid arrival: warned + dropped, located with {len(used)}/3  o
 # 2. ensure() computes only the missing key
 requests = {("XX", s, "P"): np.array(c) for (n, s), c in stations.items()}
 tic = time.time()
-rep = ensure_traveltimes(p, requests, {"P": "/tmp/vp.h5"}, max_dist=300)
+rep = ensure_traveltimes(p, requests, {"P": "./data/vp.h5"}, max_dist=300)
 dt = time.time() - tic
 assert sorted(rep["present"]) == [("XX", "A", "P"), ("XX", "B", "P")]
 assert rep["computed"] == [("XX", "C", "P")] and not rep["skipped"]
@@ -76,7 +78,7 @@ print(f"4. relocate after ensure: {len(used)}/3 picks, loc err {err:.2f} km  ok"
 with warnings.catch_warnings(record=True) as w:
     warnings.simplefilter("always")
     rep = ensure_traveltimes(p, {("XX", "A", "S"): np.array(stations[("XX", "A")])},
-                             {"P": "/tmp/vp.h5"}, max_dist=300)
+                             {"P": "./data/vp.h5"}, max_dist=300)
 assert rep["skipped"] == [("XX", "A", "S")]
 print("5. missing S velocity model: key skipped with warning  ok")
 
@@ -90,7 +92,7 @@ import numpy as np
 from pykonal.inventory import ensure_traveltimes
 rep = ensure_traveltimes("./data/ensure_test.h5",
                          {("XX","D","P"): np.array([60.,120.,0.])},
-                         {"P": "/tmp/vp.h5"}, max_dist=300)
+                         {"P": "./data/vp.h5"}, max_dist=300)
 print("computed" if rep["computed"] else "present")
 '''
 procs = [subprocess.Popen([sys.executable, "-c", worker],
