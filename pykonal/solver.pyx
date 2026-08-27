@@ -199,6 +199,45 @@ cdef class EikonalSolver(object):
         """
         return self.velocity
 
+
+    def _shape_of(self, arr):
+        return tuple(np.asarray(arr).shape)
+
+    def _npts_of(self, field):
+        return tuple(np.asarray(field.npts).astype(int).tolist())
+
+    cpdef constants.BOOL_t _check_state(EikonalSolver self):
+        """
+        Verify the lazily-built FMM state is consistent with the grid, and
+        re-point the trial heap at the live traveltime array.
+
+        Under MPI a mis-ordered setup does not fail loudly & each rank
+        quietly solves a different problem, so this is checked on every
+        solve()
+        """
+        npts = self._npts_of(self.velocity)
+
+        if self._npts_of(self.traveltime) != npts:
+            raise ValueError(
+                "traveltime grid %s does not match velocity grid %s. The "
+                "traveltime field is built the first time it is accessed; "
+                "finish configuring velocity before touching traveltime, "
+                "tt, known, unknown or trial."
+                % (self._npts_of(self.traveltime), npts)
+            )
+        if self._shape_of(self.velocity.values) != npts:
+            raise ValueError(...)
+        if self._shape_of(self.known) != npts:
+            raise ValueError(...)
+        if self._shape_of(self.unknown) != npts:
+            raise ValueError(...)
+
+        if not np.shares_memory(self.trial.values, self.traveltime.values):
+            self.trial.rebind(self.traveltime.values)
+
+        return True
+
+
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.cdivision(True)
@@ -241,9 +280,9 @@ cdef class EikonalSolver(object):
             max_idx[iax] = <Py_ssize_t> self.cy_traveltime.cy_npts[iax]
             iax_isperiodic[iax] = <constants.BOOL_t> self.cy_traveltime.cy_iax_isperiodic[iax]
 
+        self._check_state()
         tt = self.traveltime.values
         vv = self.velocity.values
-        #norm = self.velocity.norm
         norm = self.cy_velocity._norm_compact()
         known = self.known
         unknown = self.unknown

@@ -707,7 +707,7 @@ cdef class EQLocator(object):
         order = np.argsort(t0s)
         t0s, w = t0s[order], w[order]
         cw = np.cumsum(w)
-        return float(t0s[np.searchsorted(cw, 0.5 * cw[-1])])
+        return float(t0s[np.searchsorted(cw, 0.5 * cw[cw.shape[0] - 1])])
 
     """
     cpdef constants.REAL_t rms(EQLocator self, constants.REAL_t[:] hypocenter):

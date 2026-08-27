@@ -45,6 +45,7 @@ cdef class Heap(object):
         """
         return (np.asarray(self.cy_heap_index, dtype=constants.DTYPE_INT))
 
+
     @property
     def keys(self):
         """
@@ -78,6 +79,29 @@ cdef class Heap(object):
     @values.setter
     def values(self, values):
         self.cy_values = values
+
+
+    cpdef constants.BOOL_t rebind(Heap self, values):
+        """
+        Point the heap at *values* and restore the heap invariant against
+        it. Use this when the array the heap sorts by may have been
+        replaced (rather than written in place) since the heap was built.
+        """
+        self.cy_values = values
+        return self.reheapify()
+
+
+    cpdef constants.BOOL_t reheapify(Heap self):
+        """
+        Rebuild the heap invariant in O(n) from the current sort values
+        (Floyd's algorithm).
+        """
+        cdef Py_ssize_t j
+        if self.cy_keys.size() < 2:
+            return True
+        for j in range(<Py_ssize_t>(self.cy_keys.size() // 2) - 1, -1, -1):
+            self.sift_up(j)
+        return True
 
 
     cpdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) pop(Heap self):

@@ -111,6 +111,19 @@ cdef class Field3D(object):
         self.cy_min_coords = np.asarray(value, dtype=constants.DTYPE_REAL)
         self._update_max_coords()
         self._update_iax_isperiodic()
+        self._invalidate_geometry()
+
+    cdef constants.BOOL_t _invalidate_geometry(Field3D self):
+        """
+        Drop every cache derived from the grid geometry. Called by the
+        min_coords / node_intervals / npts setters so a field can never be
+        left describing one grid with caches built for another.
+        """
+        self.cy_nodes               = None
+        self.cy_gradient            = None
+        self.cy_norm_compact_isset  = False
+        self.cy_step_size_isset     = False
+        return True
 
     @property
     def max_coords(self):
@@ -118,7 +131,7 @@ cdef class Field3D(object):
         [*Read only*, :class:`numpy.ndarray`\ (shape=(3,), dtype=numpy.float)]
         Array specifying the upper bound of each axis.
         """
-        return (np.asarray(self.cy_max_coords))
+        return np.asarray(self.cy_max_coords)
 
     @property
     def node_intervals(self):
@@ -127,7 +140,7 @@ cdef class Field3D(object):
         Array of node intervals along each axis. This attribute must be
         initialized by the user.
         """
-        return (np.asarray(self.cy_node_intervals))
+        return np.asarray(self.cy_node_intervals)
 
     @node_intervals.setter
     def node_intervals(self, value):
@@ -138,6 +151,7 @@ cdef class Field3D(object):
         self.cy_node_intervals = value
         self._update_max_coords()
         self._update_iax_isperiodic()
+        self._invalidate_geometry()
 
     @property
     def nodes(self):
@@ -236,6 +250,7 @@ cdef class Field3D(object):
         self._update_max_coords()
         self._update_iax_isnull()
         self._update_iax_isperiodic()
+        self._invalidate_geometry()        
 
     @property
     def step_size(self):
@@ -330,14 +345,13 @@ cdef class Field3D(object):
         str key=None,
         constants.BOOL_t overwrite=False,
         constants.BOOL_t compress=True,
-        constants.BOOL_t low_precision=True
-    ):
+        constants.BOOL_t low_precision=True):
         """
         to_hdf(self, path, key=None, overwrite=False, compress=True, low_precision=True)
 
         Save the field to an HDF5 file.
 
-        :param compress: If True, write `values` with gzip compression.
+        :param compress: If True, write 'values' with gzip compression.
                          Field data (especially traveltime/velocity fields)
                          tends to be spatially smooth and compresses well.
         :type compress: bool
@@ -353,26 +367,20 @@ cdef class Field3D(object):
         """
 
         with h5py.File(path, mode="a") as f5:
-
             if key is not None:
-
                 if key in f5 and overwrite is True:
                     del (f5[key])
-
                 group = f5.create_group(key)
 
             else:
-
                 group = f5["/"]
 
             group.attrs["coord_sys"] = self.coord_sys
             group.attrs["field_type"] = self.field_type
 
             for attr in ("min_coords", "node_intervals", "npts"):
-
                 if attr in group and overwrite is True:
                     del (group[attr])
-
                 group.create_dataset(attr, data=getattr(self, attr))
 
             if "values" in group and overwrite is True:
@@ -404,7 +412,7 @@ cdef class Field3D(object):
         :param origin: Coordinates of the origin of the new frame with
                        respect to the old frame of reference.
         :type origin: tuple(float, float, float)
-        :param force_phi_positive: Force :math:`\phi` to be in [0, 2:math:`pi`)
+        :param force_phi_positive: Force phi to be in [0, 2:pi)
                                    for output spherical coordinates.
         :type force_phi_positive: bool
         :return: Node coordinates in new frame of reference.
@@ -426,6 +434,7 @@ cdef class Field3D(object):
             return (transformations.xyz2xyz(self.nodes, origin))
         else:
             raise (NotImplementedError())
+
 
 
 
@@ -471,17 +480,30 @@ cdef class ScalarField3D(Field3D):
         values = np.asarray(value, dtype=constants.DTYPE_REAL)
         if not np.all(values.shape == self.npts):
             raise (ValueError("Shape of values does not match npts attribute."))
-        self.cy_values = values
-        # Invalidate caches that depend on field values. cy_gradient is a
-        # typed cdef attribute (VectorField3D), not a dict-backed Python
-        # attribute, so `del self.cy_gradient` is not supported by Cython
-        # ("Cannot delete C attribute of extension type") -- reset to None
-        # instead, which the gradient property already treats as "not yet
-        # computed".
+        # Write into the existing buffer rather than rebinding whenever one
+        # of a compatible shape already exists. Anything else holding a view
+        # of this field's values -- most importantly heapq.Heap, which sorts
+        # the FMM narrow band by traveltime -- keeps seeing live data.
+        # An unset typed memoryview raises AttributeError on access rather
+        # than comparing equal to None, hence try/except.
+        try:
+            reuse = (
+                    self.cy_values.shape[0] == values.shape[0]
+                and self.cy_values.shape[1] == values.shape[1]
+                and self.cy_values.shape[2] == values.shape[2]
+            )
+        except AttributeError:
+            reuse = False
+
+        if reuse:
+            np.asarray(self.cy_values)[...] = values
+        else:
+            self.cy_values = values
         self.cy_gradient = None
 
 
-    cpdef np.ndarray[constants.REAL_t, ndim=1] resample(ScalarField3D self, constants.REAL_t[:,:] points, constants.REAL_t null=np.nan):
+    cpdef np.ndarray[constants.REAL_t, ndim=1] resample(
+        ScalarField3D self, constants.REAL_t[:,:] points, constants.REAL_t null=np.nan):
         """
         resample(self, points, null=numpy.nan)
 
@@ -509,8 +531,7 @@ cdef class ScalarField3D(Field3D):
 
     cpdef np.ndarray[constants.REAL_t, ndim=2] trace_ray(
             ScalarField3D self,
-            constants.REAL_t[:] end
-    ):
+            constants.REAL_t[:] end):
         """
         trace_ray(self, end)
 
@@ -531,7 +552,7 @@ cdef class ScalarField3D(Field3D):
 
         cdef cpp_vector[constants.REAL_t]         ray
         cdef constants.REAL_t                     norm, step_size, value, value_1back
-        cdef constants.REAL_t[3]                  gg
+        cdef constants.REAL_t[3]                  gg, pt_local
         cdef constants.REAL_t[:]                  point
         cdef Py_ssize_t                           idx
         cdef str                                  coord_sys
@@ -574,7 +595,9 @@ cdef class ScalarField3D(Field3D):
                 gg[1] /= point[0]
                 gg[2] /= point[0] * sin(point[1])
             for idx in range(3):
-                ray.push_back(point[idx] - step_size * gg[idx])
+                pt_local[idx] = point[idx]      # all reads, before anything moves
+            for idx in range(3):
+                ray.push_back(pt_local[idx] - step_size * gg[idx])   # all writes
 
         if ray.size() < 4:
             return None  # degenerate    
@@ -689,18 +712,20 @@ cdef class ScalarField3D(Field3D):
 
     cpdef VectorField3D _gradient_of_spherical(ScalarField3D self):
         """
-        The gradient of a field represented on a spherical grid.
+        The gradient of a field represented on a spherical grid
         """
         grid       = self.nodes
         d0, d1, d2 = self.node_intervals
-        n0, n1, n2 = self.npts
+        n0, n1, n2 = np.asarray(self.npts).astype(int)
 
-        # The forward/backward second-order edge-difference formulas below
-        # index up to 3 nodes in from each edge (e.g. self.values[2] and
-        # self.values[-3]). For npts < 3 along a non-null axis those
-        # indices either don't exist or alias onto each other, silently
-        # producing a wrong gradient rather than a clear error -- so we
-        # check explicitly up front instead.
+        # DEBUG
+        _vshape = np.asarray(self.values).shape
+        _npts   = tuple(np.asarray(self.npts).astype(int).tolist())
+        if tuple(_vshape) != _npts:
+            raise ValueError(
+                "values.shape=%s disagrees with npts=%s" % (tuple(_vshape), _npts)
+            )
+
         for iax, n in enumerate((n0, n1, n2)):
             if not self.iax_isnull[iax] and n < 3:
                 raise ValueError(
@@ -711,7 +736,6 @@ cdef class ScalarField3D(Field3D):
                 )
 
         if not self.iax_isnull[0]:
-            # Second-order forward difference evaluated along the lower edge
             g0_lower = (
                 (
                         self.values[2]
@@ -719,14 +743,12 @@ cdef class ScalarField3D(Field3D):
                     + 3*self.values[0]
                 ) / (2*d0)
             ).reshape(1, n1, n2)
-            # Second order central difference evaluated in the interior
-            g0_interior = (self.values[2:] - self.values[:-2]) / (2*d0)
-            # Second order backward difference evaluated along the upper edge
+            g0_interior = (self.values[2:] - self.values[0:n0-2]) / (2*d0)
             g0_upper = (
                 (
-                        self.values[-3]
-                    - 4*self.values[-2]
-                    + 3*self.values[-1]
+                        self.values[n0-3]
+                    - 4*self.values[n0-2]
+                    + 3*self.values[n0-1]
                 ) / (2*d0)
             ).reshape(1, n1, n2)
             g0 = np.concatenate([g0_lower, g0_interior, g0_upper], axis=0)
@@ -734,7 +756,6 @@ cdef class ScalarField3D(Field3D):
             g0 = np.zeros((n0, n1, n2))
 
         if not self.iax_isnull[1]:
-            # Second-order forward difference evaluated along the lower edge
             g1_lower = (
                 (
                         self.values[:,2]
@@ -742,25 +763,22 @@ cdef class ScalarField3D(Field3D):
                     + 3*self.values[:,0]
                 ) / (2*grid[:,0,:,0]*d1)
             ).reshape(n0, 1, n2)
-            # Second order central difference evaluated in the interior
             g1_interior = (
                   self.values[:,2:]
-                - self.values[:,:-2]
-            ) / (2*grid[:,1:-1,:,0]*d1)
-            # Second order backward difference evaluated along the upper edge
+                - self.values[:,0:n1-2]
+            ) / (2*grid[:,1:n1-1,:,0]*d1)
             g1_upper = (
                 (
-                        self.values[:,-3]
-                    - 4*self.values[:,-2]
-                    + 3*self.values[:,-1]
-                ) / (2*grid[:,-1,:,0]*d1)
+                        self.values[:,n1-3]
+                    - 4*self.values[:,n1-2]
+                    + 3*self.values[:,n1-1]
+                ) / (2*grid[:,n1-1,:,0]*d1)
             ).reshape(n0, 1, n2)
             g1 = np.concatenate([g1_lower, g1_interior, g1_upper], axis=1)
         else:
             g1 = np.zeros((n0, n1, n2))
 
         if not self.iax_isnull[2]:
-            # Second-order forward difference evaluated along the lower edge
             g2_lower = (
                   (
                         self.values[:,:,2]
@@ -768,23 +786,21 @@ cdef class ScalarField3D(Field3D):
                     + 3*self.values[:,:,0]
                 ) / (2*grid[:,:,0,0]*np.sin(grid[:,:,0,1])*d2)
             ).reshape(n0, n1, 1)
-
-            # Second order central difference evaluated in the interior
             g2_interior = (
                   self.values[:,:,2:]
-                - self.values[:,:,:-2]
-            ) / (2*grid[:,:,1:-1,0]*np.sin(grid[:,:,1:-1,1])*d2)
-            # Second order backward difference evaluated along the upper edge
+                - self.values[:,:,0:n2-2]
+            ) / (2*grid[:,:,1:n2-1,0]*np.sin(grid[:,:,1:n2-1,1])*d2)
             g2_upper = (
                 (
-                        self.values[:,:,-3]
-                    - 4*self.values[:,:,-2]
-                    + 3*self.values[:,:,-1]
-                ) / (2*grid[:,:,-1,0]*np.sin(grid[:,:,-1,1])*d2)
+                        self.values[:,:,n2-3]
+                    - 4*self.values[:,:,n2-2]
+                    + 3*self.values[:,:,n2-1]
+                ) / (2*grid[:,:,n2-1,0]*np.sin(grid[:,:,n2-1,1])*d2)
             ).reshape(n0, n1, 1)
             g2 = np.concatenate([g2_lower, g2_interior, g2_upper], axis=2)
         else:
             g2 = np.zeros((n0, n1, n2))
+
         gg = np.moveaxis(np.stack([g0, g1, g2]), 0, -1)
         grad = VectorField3D(coord_sys=self.coord_sys)
         grad.min_coords = self.min_coords
@@ -793,15 +809,16 @@ cdef class ScalarField3D(Field3D):
         grad.values = gg
         return grad
 
+
+
 cdef class VectorField3D(Field3D):
     """
-    Class for representing 3D vector fields.
+    Class for representing 3D vector fields
     """
 
     def __init__(self, coord_sys="cartesian"):
         super(VectorField3D, self).__init__(coord_sys=coord_sys)
         self.cy_field_type = "vector"
-
 
     @property
     def values(self):
@@ -821,7 +838,6 @@ cdef class VectorField3D(Field3D):
         if not np.all(values.shape[:3] == self.npts):
             raise (ValueError("Shape of values does not match npts attribute."))
         self.cy_values = np.asarray(value)
-
 
     @cython.initializedcheck(False)
     cdef void value_c(
@@ -884,8 +900,7 @@ cdef class VectorField3D(Field3D):
                 pt_iax = self.cy_min_coords[iax] + pt_iax
             elif (
                 (pt_iax < self.cy_min_coords[iax] or pt_iax > self.cy_max_coords[iax])
-                and not self.cy_iax_isnull[iax]
-            ):
+                and not self.cy_iax_isnull[iax]):
                 # Restored bounds check (was previously commented out
                 # entirely). Without this, out-of-range points fall through
                 # to raw array indexing below with no guarantee the
@@ -954,6 +969,8 @@ cdef class VectorField3D(Field3D):
         self.value_c(&point[0], ff, null)
         return np.asarray(ff)
 
+
+
 cpdef Field3D load(str path):
     """
     .. deprecated:: 0.3.2
@@ -966,7 +983,6 @@ cpdef Field3D load(str path):
     :return: A Field3D-derivative class initialized with data in *path*.
     :rtype: ScalarField3D or VectorField3D
     """
-
     warning_message = "The load() function is deprecated and will be removed"\
         " from future versions of PyKonal. Use pykonal.fields.read_hdf()"\
         " instead."

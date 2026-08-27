@@ -20,7 +20,7 @@ packages        = ["pykonal"]
 package_data    = {
     "pykonal": ["data/*", "tests/data/*"],
 }
-required        = ["cython>=3.2.4", "h5py", "numpy", "scipy>=1.16"]
+required        = ["cython>=3.3.0", "h5py", "numpy>=2.1.3", "scipy>=1.16"]
 extras          = {"tests": ["nose"]}
 ext_modules     = cythonize(
     [

@@ -11,6 +11,8 @@ cdef class Heap(object):
     cdef constants.REAL_t[:,:,:] cy_values
     cdef Py_ssize_t[:,:,:]       cy_heap_index
 
+    cpdef constants.BOOL_t rebind(Heap self, values)
+    cpdef constants.BOOL_t reheapify(Heap self)
     cpdef (Py_ssize_t, Py_ssize_t, Py_ssize_t) pop(Heap self)
     cpdef constants.BOOL_t push(Heap self, Py_ssize_t i1, Py_ssize_t i2, Py_ssize_t i3)
     cpdef constants.BOOL_t sift_down(Heap self, Py_ssize_t j_start, Py_ssize_t j)

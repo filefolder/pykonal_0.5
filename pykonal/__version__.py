@@ -1,6 +1,6 @@
 __major_version__  = 0
 __minor_version__  = 5
-__patch__          = 6
+__patch__          = 7
 __release__        = ''
 __version_tuple__ = (
     __major_version__,

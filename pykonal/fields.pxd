@@ -21,6 +21,7 @@ cdef class Field3D(object):
     cdef constants.REAL_t          cy_step_size
     cdef constants.BOOL_t          cy_step_size_isset
 
+    cdef constants.BOOL_t _invalidate_geometry(Field3D self)
     cdef constants.BOOL_t _update_max_coords(Field3D self)
     cdef constants.BOOL_t _update_iax_isnull(Field3D self)
     cdef constants.BOOL_t _update_iax_isperiodic(Field3D self)
