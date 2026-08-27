@@ -43,6 +43,7 @@ cdef class EQLocator(object):
         # NLL-style additions
         self.cy_stations            = {}
         self.cy_pick_errors         = {}
+        self.cy_variance_floor      = 0.01  # a-posteriori data variance floor (s^2)
         self.cy_default_pick_error  = 0.02  # seconds
         # NaN = "use the number of arrivals", matching NonLinLoc's EDT pdf
         # (the pair sum raised to the power N). Set a number to override.
@@ -280,8 +281,18 @@ cdef class EQLocator(object):
     @default_pick_error.setter
     def default_pick_error(self, value):
         if value <= 0:
-            raise ValueError("default_pick_error must be > 0")
+            value = 1e-5 # silent correction in this instance
         self.cy_default_pick_error = value
+
+    @property
+    def variance_floor(self):
+        return self.cy_variance_floor
+
+    @variance_floor.setter
+    def variance_floor(self, value):
+        if value < 0:
+            raise ValueError("variance_floor must be >= 0")
+        self.cy_variance_floor = value
 
     @property
     def edt_exponent(self):
@@ -408,12 +419,12 @@ cdef class EQLocator(object):
         self.cy_obs       = np.array(
             [self.cy_arrivals[key] for key in keys], dtype=np.float64
         )
-        self.cy_sigma     = np.array(
-            [
-                self.cy_pick_errors.get(key, self.cy_default_pick_error)
-                for key in keys
-            ],
-            dtype=np.float64
+        self.cy_sigma = np.maximum(
+            np.array(
+                [self.cy_pick_errors.get(key, self.cy_default_pick_error) for key in keys],
+                dtype=np.float64,
+            ),
+            1e-5,
         )
         self.cy_tt_work   = np.empty(n, dtype=np.float64)
         self.cy_ot_work   = np.empty(n, dtype=np.float64)
@@ -423,7 +434,7 @@ cdef class EQLocator(object):
 
     cdef int _fill_traveltimes(EQLocator self, constants.REAL_t[:] hypo_xyz):
         """
-        Interpolate every arrival's traveltime at
+        Interpolate every arrival traveltime at
         hypo_xyz into cy_tt_work. Invalid nodes are set to INFINITY. Returns
         the number of valid traveltimes.
         """
@@ -544,12 +555,12 @@ cdef class EQLocator(object):
             tta = self.cy_tt_work[ia]
             if isinf(tta):
                 continue
-            va = self.cy_sigma[ia] * self.cy_sigma[ia] + alpha_sq * tta * tta
+            va = self.cy_variance_floor + self.cy_sigma[ia]*self.cy_sigma[ia] + alpha_sq*tta*tta
             for ib in range(ia + 1, n):
                 ttb = self.cy_tt_work[ib]
                 if isinf(ttb):
                     continue
-                vb = self.cy_sigma[ib] * self.cy_sigma[ib] + alpha_sq * ttb * ttb
+                vb = self.cy_variance_floor + self.cy_sigma[ib]*self.cy_sigma[ib] + alpha_sq*ttb*ttb
                 vv = va + vb
                 r = (self.cy_obs[ia] - self.cy_obs[ib]) - (tta - ttb)
                 prob = exp(-0.5 * (r * r) / vv) / sqrt(vv)
@@ -576,10 +587,7 @@ cdef class EQLocator(object):
                 tta = self.cy_tt_work[ia]
                 if isinf(tta):
                     continue
-                sig2_sum += (
-                    self.cy_sigma[ia] * self.cy_sigma[ia]
-                    + alpha_sq * tta * tta
-                )
+                sig2_sum += self.cy_variance_floor + self.cy_sigma[ia]*self.cy_sigma[ia] + alpha_sq*tta*tta
                 nvalid += 1
                 ot_i = self.cy_obs[ia] - tta
                 ot_w = self.cy_ot_work[ia]
@@ -1201,11 +1209,32 @@ cdef class EQLocator(object):
         posterior and understates uncertainty on weak geometry, which is
         the dangerous direction to be wrong in.
 
+        rounds = 2 is the safe call. Above this can be counter-productive.
+
         proposal="uniform" restores the original behaviour.
         """
         rng = np.random.default_rng(seed)
         hypocenter = np.asarray(hypocenter, dtype=np.float64)[:3]
         delta = np.asarray(delta, dtype=np.float64)[:3]
+
+        # a-posteriori data variance floor: the reported uncertainty must reflect
+        # how badly the data actually fit, not only the a-priori pick/alpha terms.
+        # Without this a user setting pick_error~0 and alpha=0 gets a spuriously
+        # sharp posterior even with large residuals. Measure the residual variance
+        # at the solution and floor every pair's variance with it (NLL-consistent:
+        # the observational covariance carries the real misfit scale).
+        _saved_vfloor = self.cy_variance_floor
+        if self.cy_keys is None:
+            self._prepare_workspace()
+        if self._fill_traveltimes(hypocenter[:3]) >= 2:
+            tt = np.asarray(self.cy_tt_work)
+            obs = np.asarray(self.cy_obs)
+            finite = ~np.isinf(tt)
+            if finite.sum() > 4:
+                r = obs[finite] - tt[finite]
+                r = r - np.median(r)          # remove origin-time (robust center)
+                dof = finite.sum() - 4
+                self.cy_variance_floor = float(np.sum(r*r) / dof)
 
         if exponent is None:
             exponent = max(len(self.cy_arrivals), 1)
@@ -1241,8 +1270,8 @@ cdef class EQLocator(object):
                 # Cap the inflated proposal at half the search box. Draws
                 # outside the box are rejected, so an inflated proposal that
                 # is wide relative to a contracted box loses almost every
-                # sample and trips the <16 survivors bail-out into the
-                # uniform fallback -- which is exactly the degenerate path
+                # sample and trips the < 16 survivors bail-out into the
+                # uniform fallback which is exactly the degenerate path
                 # the hessian proposal exists to avoid.
                 _sig = np.sqrt(np.clip(np.diag(cov), 1e-12, None))
                 _cap = np.min(np.maximum(0.5 * delta_km, 1e-6) / _sig)
@@ -1422,13 +1451,19 @@ cdef class EQLocator(object):
 
         # Monte Carlo standard error on the reported sigma, as a FRACTION
         # of sigma. Importance-sampling variance estimates have relative
-        # error ~1/sqrt(2*ESS), so at ESS=80 the sigma is only good to
-        # about 8% -- worth knowing before treating a change of that size
+        # error ~1/sqrt(2*ESS), so at ESS=80 the sigma is only good to ~8%
         # as real.
         sigma_rel_mcse = float(1.0 / np.sqrt(2.0 * max(ess, 1.0)))
 
+        if not np.all(np.isfinite(w)) or w.sum() <= 0:
+            raise RuntimeError("posterior weights degenerate (check pick errors / alpha)")
+        w = w / w.sum()
+
         scatter_idx = rng.choice(len(samples), size=int(nscatter), p=w)
         scatter = samples[scatter_idx]
+
+        # Restore da floor
+        self.cy_variance_floor = _saved_vfloor
 
         return {
             "scatter": scatter,

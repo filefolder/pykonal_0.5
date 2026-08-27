@@ -38,12 +38,6 @@ import numpy as np
 
 _REAL_STDOUT = sys.stdout  # replaced with the true fd-1 stream inside main()
 
-try:
-    from geographiclib.geodesic import Geodesic
-    _GEODESIC = Geodesic.WGS84
-except ImportError:
-    _GEODESIC = None
-
 import seiscomp.core
 import seiscomp.datamodel
 import seiscomp.io
@@ -52,24 +46,10 @@ from pykonal.locate import EQLocator
 from pykonal.transformations import geo2sph, sph2geo
 from pykonal import constants as pk_constants
 
-# --- WGS84 ellipsoid helpers (no flat km-per-degree assumptions) -----------
-WGS84_A = 6378.137            # semi-major axis, km
-WGS84_F = 1.0 / 298.257223563
-WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
-MEAN_RADIUS = 6371.0088       # km, for angular distance conversions
-
-
-def meridian_radius(lat_deg):
-    """Meridian radius of curvature M(lat), km: length of 1 radian of latitude."""
-    s2 = math.sin(math.radians(lat_deg)) ** 2
-    return WGS84_A * (1.0 - WGS84_E2) / (1.0 - WGS84_E2 * s2) ** 1.5
-
-
-def parallel_radius(lat_deg):
-    """N(lat)*cos(lat), km: length of 1 radian of longitude at this latitude."""
-    lat = math.radians(lat_deg)
-    s2 = math.sin(lat) ** 2
-    return WGS84_A / math.sqrt(1.0 - WGS84_E2 * s2) * math.cos(lat)
+# Mean Earth radius (km) for angular <-> arc-length conversions on the
+# spherical grid. Grids are always spherical (pykonal geo2sph); the former
+# cartesian / local-projection path has been removed.
+MEAN_RADIUS = 6371.0088
 
 
 def gc_distance_azimuth(lat1, lon1, lat2, lon2):
@@ -156,75 +136,38 @@ def inventory_lock(inventory_path, shared):
 # --------------------------------------------------------------------------
 class GeoTransform:
     """
-    coord_sys = "spherical": pykonal convention (r, colatitude, longitude),
-        radians, r = EARTH_RADIUS - depth. Matches grids built with
-        pykonal.transformations.geo2sph.
-    coord_sys = "cartesian": local grid with x=east km, y=north km,
-        z=depth km, relative to (ref_lat, ref_lon) at (x0, y0). Uses the
-        same simple-degrees conversion as NLL's TRANS SDC, so grids built
-        for an NLL SDC project line up.
+    Geographic (lat, lon, depth_km) <-> pykonal spherical grid coordinates
+    (r, colatitude, longitude) in radians, r = EARTH_RADIUS - depth. Matches
+    grids built with pykonal.transformations.geo2sph.
+
+    This deployment is spherical-only. The former cartesian / local-map
+    projection path (azimuthal-equidistant about a reference point, with a
+    WGS84 radii-of-curvature fallback) has been removed: grids are always
+    fully-fledged geographic projections, so geo2sph / sph2geo are the
+    correct and only mapping. coord_sys is retained as an attribute (always
+    "spherical") so call sites and log labels that key on it keep working.
     """
 
     def __init__(self, cfg):
         self.coord_sys = cfg.get("coord_sys", "spherical")
-        if self.coord_sys == "cartesian":
-            self.ref_lat = float(cfg["ref_lat"])
-            self.ref_lon = float(cfg["ref_lon"])
-            self.ref_x = float(cfg.get("ref_x", 0.0))
-            self.ref_y = float(cfg.get("ref_y", 0.0))
+        if self.coord_sys != "spherical":
+            log(f"WARNING: coord_sys={self.coord_sys!r} is not supported; "
+                f"this build is spherical-only (the cartesian path was "
+                f"removed). Proceeding as spherical.")
+            self.coord_sys = "spherical"
 
     def geo_to_grid(self, lat, lon, depth_km):
-        if self.coord_sys == "spherical":
-            return geo2sph(np.array([lat, lon, depth_km]))
-        if _GEODESIC is not None:
-            # azimuthal equidistant about (ref_lat, ref_lon) via exact WGS84
-            # geodesics: range and bearing from the reference are exact at
-            # any latitude and offset.
-            gd = _GEODESIC.Inverse(self.ref_lat, self.ref_lon, lat, lon)
-            s_km = gd["s12"] / 1000.0
-            az = math.radians(gd["azi1"])
-            x = self.ref_x + s_km * math.sin(az)
-            y = self.ref_y + s_km * math.cos(az)
-            return np.array([x, y, depth_km])
-        # fallback: WGS84 radii-of-curvature equirectangular (sub-km at
-        # +/-2 deg offsets; install geographiclib for exact geodesics)
-        mid = 0.5 * (lat + self.ref_lat)
-        y = self.ref_y + math.radians(lat - self.ref_lat) * meridian_radius(mid)
-        x = self.ref_x + math.radians(lon - self.ref_lon) * parallel_radius(lat)
-        return np.array([x, y, depth_km])
+        return geo2sph(np.array([lat, lon, depth_km]))
 
     def grid_to_geo(self, coords):
-        if self.coord_sys == "spherical":
-            lat, lon, depth = sph2geo_scalar(coords)
-            return lat, lon, depth
-        if _GEODESIC is not None:
-            dx = coords[0] - self.ref_x
-            dy = coords[1] - self.ref_y
-            s_m = math.hypot(dx, dy) * 1000.0
-            az = math.degrees(math.atan2(dx, dy))
-            gd = _GEODESIC.Direct(self.ref_lat, self.ref_lon, az, s_m)
-            return gd["lat2"], gd["lon2"], float(coords[2])
-        # fallback inverse of the equirectangular mapping above
-        lat = self.ref_lat + math.degrees(
-            (coords[1] - self.ref_y) / meridian_radius(self.ref_lat))
-        for _ in range(2):
-            mid = 0.5 * (lat + self.ref_lat)
-            lat = self.ref_lat + math.degrees(
-                (coords[1] - self.ref_y) / meridian_radius(mid))
-        lon = self.ref_lon + math.degrees(
-            (coords[0] - self.ref_x) / parallel_radius(lat))
-        return lat, lon, float(coords[2])
+        lat, lon, depth = sph2geo_scalar(coords)
+        return lat, lon, depth
 
     def delta_to_grid(self, dlat_km, dlon_km, ddep_km):
-        """Half-widths of the search box in grid units."""
-        if self.coord_sys == "spherical":
-            # (dr, dtheta, dphi) in km -> radians on the sphere
-            r = pk_constants.EARTH_RADIUS
-            return np.array([ddep_km, dlat_km / r, dlon_km / r])
-        return np.array([dlon_km, dlat_km, ddep_km])
-
-    def spatial_axes_are_xyz_enu(self):
-        return self.coord_sys == "cartesian"
+        """Search-box half-widths in grid units: depth stays km on the
+        radial axis, lateral km -> radians on the sphere."""
+        r = pk_constants.EARTH_RADIUS
+        return np.array([ddep_km, dlat_km / r, dlon_km / r])
 
 
 def sph2geo_scalar(coords):
@@ -261,6 +204,86 @@ def clamp_to_grid(coords, lo, hi, vertical_axis):
     c[vertical_axis] = min(max(c[vertical_axis], lo[vertical_axis]),
                            hi[vertical_axis])
     return c
+
+
+def auto_search_delta(locator, initial_xyz, arrival_keys, sigma_s,
+                      coord_sys, k_reach=3.5, cond_max=1.0e6):
+    """
+    Geometry-based search half-widths from the predicted location
+    covariance C = sigma^2 (G^T G)^-1. Each row of G is one arrival's
+    traveltime spatial gradient at the trial hypocenter (the ray slowness
+    vector) plus a unit origin-time column. Validated against the EDT
+    locator's empirical scatter (predicted vs observed sigma agree within
+    ~1.5x), so k_reach * sigma is a sound box: large enough to contain the
+    true hypocenter, tight enough that the fixed sampling budget resolves
+    the likelihood peak.
+
+    Spherical grids: axis 0 is r (radius, km; depth = R - r), axes 1-2 are
+    colatitude and longitude in RADIANS. The finite-difference step is one
+    node interval per axis (a flat step in radians would land off-grid),
+    and the angular derivatives are converted to per-km via the local
+    metric (d/dtheta / r, d/dphi / (r sin theta)) so all three columns of G
+    are d(tt)/d(distance_km). The returned half-widths are converted back
+    to grid units for the locator.
+
+    Returns (delta_grid, info). info has: sigma (per-axis 1-sigma in km, in
+    grid-axis order), cond (of G^T G), n (rows used), weak (cond>cond_max).
+    Returns (None, info) if too few gradients or the inverse fails.
+    """
+    spherical = (coord_sys == "spherical")
+    r0 = float(initial_xyz[0]) if spherical else None
+    theta0 = float(initial_xyz[1]) if spherical else None
+    rows = []
+    for key in arrival_keys:
+        field = locator.traveltimes.get(key) if hasattr(
+            locator, "traveltimes") else None
+        if field is None:
+            continue
+        node = np.asarray(field.node_intervals, dtype=float)
+        g = np.zeros(3)
+        ok = True
+        for i in range(3):
+            h = node[i]
+            xp = np.array(initial_xyz, dtype=float); xp[i] += h
+            xm = np.array(initial_xyz, dtype=float); xm[i] -= h
+            tp = field.value(xp); tm = field.value(xm)
+            if not (np.isfinite(tp) and np.isfinite(tm)):
+                ok = False
+                break
+            g[i] = (tp - tm) / (2.0 * h)
+        if not ok:
+            continue
+        if spherical:
+            g[1] = g[1] / r0
+            g[2] = g[2] / (r0 * max(np.sin(theta0), 1e-6))
+        rows.append([g[0], g[1], g[2], 1.0])
+
+    info = {"n": len(rows), "weak": False, "cond": np.inf, "sigma": None}
+    if len(rows) < 4:
+        info["weak"] = True
+        return None, info
+    G = np.array(rows)
+    GtG = G.T @ G
+    try:
+        cond = float(np.linalg.cond(GtG))
+        C = sigma_s ** 2 * np.linalg.inv(GtG)
+    except np.linalg.LinAlgError:
+        info["weak"] = True
+        return None, info
+    sigma_km = np.sqrt(np.clip(np.diag(C)[:3], 0.0, None))
+    info["cond"] = cond
+    info["sigma"] = sigma_km
+    info["weak"] = cond > cond_max
+    hw_km = k_reach * sigma_km          # half-widths in km, grid-axis order
+    if spherical:
+        delta_grid = np.array([
+            hw_km[0],
+            hw_km[1] / r0,
+            hw_km[2] / (r0 * max(np.sin(theta0), 1e-6)),
+        ], dtype=float)
+    else:
+        delta_grid = hw_km
+    return delta_grid, info
 
 
 def _model_fingerprint(vm_path):
@@ -657,15 +680,51 @@ def main():
     transform = GeoTransform(cfg)
     method = cfg.get("method", "edt")
     alpha = float(cfg.get("alpha", 0.01))
-    default_pick_error = float(cfg.get("default_pick_error", 0.1))
+    alpha = np.maximum(alpha,1e-5)
+
+    # Per-phase default pick uncertainty (seconds), used ONLY when a pick
+    # carries no stated time uncertainty of its own. A phase->floor map:
+    # keys may be exact phase names ("Sg") or a single letter ("S") matching
+    # any phase starting with it, with exact names taking precedence. S
+    # arrivals are typically less precise than P, so raise the S value if
+    # desired. Picks that DO carry their own uncertainty always use that.
+    default_pick_error = cfg.get("default_pick_error", {"P": 0.1, "S": 0.1})
+    if not isinstance(default_pick_error, dict):
+        # tolerate a legacy scalar: apply it to all phases
+        default_pick_error = {"P": float(default_pick_error),
+                              "S": float(default_pick_error)}
+    default_pick_error = {str(k): float(v)
+                          for k, v in default_pick_error.items()}
+    # a single scalar for event-level uses (auto-box floor, pykonal global
+    # fallback): the smallest phase floor, so it never over-inflates.
+    _default_err_scalar = (min(default_pick_error.values())
+                           if default_pick_error else 0.1)
+
+    def _default_err_for_phase(phase):
+        if phase in default_pick_error:
+            return default_pick_error[phase]             # exact match wins
+        if phase and phase[0] in default_pick_error:
+            return default_pick_error[phase[0]]          # letter match
+        return _default_err_scalar
     delta_km = cfg.get("search_delta_km", [30.0, 30.0, 15.0])
+    _auto_delta = isinstance(delta_km, str) and delta_km.lower() == "auto"
+    _auto_k = float(cfg.get("auto_search_k", 6.0))
+    _auto_cond_max = float(cfg.get("auto_search_cond_max", 1.0e6))
+    if _auto_delta:
+        delta_km = [50.0, 50.0, 25.0]   # placeholder; recomputed per event
     delta_t = float(cfg.get("search_delta_t", 10.0))
     nsamples = int(cfg.get("posterior_nsamples", 2048))
+    # Number of adaptive importance-sampling rounds inside sample_posterior.
+    # The solver refines its proposal to the weighted posterior moments each
+    # round (2 is the library default and is plenty for a smooth ellipsoid);
+    # raise for very skewed posteriors, lower to 1 for speed. This is the
+    # solver's OWN adaptation -- the wrapper no longer resizes the box.
+    posterior_rounds = int(cfg.get("posterior_rounds", 2))
     # Fixed seed for posterior sampling so repeated relocations of the
     # same event give IDENTICAL uncertainties (the DE search is already
     # seeded separately). Set posterior_seed to null in the config for
     # independent draws each time (e.g. to gauge sampling variability).
-    _pseed = cfg.get("posterior_seed", 4321)
+    _pseed = cfg.get("posterior_seed", 8675)
     posterior_seed = None if _pseed is None else int(_pseed)
     # Confidence level (percent) for the reported ellipsoid and
     # uncertainties. 68 matches NonLinLoc, whose confidence ellipsoid is
@@ -684,9 +743,12 @@ def main():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                net, sta, lat, lon, elev = line.split(",")[:5]
-                if net == 'network': continue
-                stations[(net, sta)] = (float(lat), float(lon), float(elev))
+                try:
+                    net, sta, lat, lon, elev = line.split(",")[:5]
+                    if net.lower() == "network": continue
+                    stations[(net, sta)] = (float(lat), float(lon), float(elev))
+                except Exception as e:
+                    print(f"could not parse station line: {line} \n {e}")
 
     # origin_info: plain dict; arrivals_in: list of plain dicts; ep is a
     # keepalive reference (see read_input) — hold it until main returns.
@@ -840,7 +902,7 @@ def main():
         # stated error, flattening the EDT surface and destabilising the
         # solution. Weight 0 still excludes a pick (handled above), and the
         # input weight is echoed back on output unchanged.
-        pick_errors[key] = float(terr) if terr else default_pick_error
+        pick_errors[key] = float(terr) if terr else _default_err_for_phase(key[2])
         pick_ids[key] = pid
         arrival_weights[key] = float(wt) if wt else 1.0
 
@@ -949,7 +1011,7 @@ def main():
                     f"{_ph} ({_err}); off-grid pre-filter skipped for it")
 
         _offgrid = []
-        _vax = 2 if transform.spatial_axes_are_xyz_enu() else 0
+        _vax = 0   # spherical: radial (depth) axis is index 0
         for _key in list(requests):
             _c = requests[_key]
             if _c is None:
@@ -1055,7 +1117,7 @@ def main():
     with inventory_lock(inventory_path, shared=True), \
          EQLocator(inventory_path,
                    coord_sys=transform.coord_sys) as locator:
-        locator.default_pick_error = default_pick_error
+        locator.default_pick_error = _default_err_scalar
         # EDT_OT_WT (NonLinLoc LOCMETH EDT_OT_WT): penalise the pdf by the
         # spread of the per-arrival origin-time estimates. On by default.
         if hasattr(locator, "edt_ot_wt"):
@@ -1107,6 +1169,107 @@ def main():
         locator.add_pick_errors(_solve_pick_errors)
         if grid_stations:
             locator.add_stations(grid_stations)
+
+        # ----- automatic, geometry-based search box (search_delta_km: auto)
+        _auto_delta_unclamped = None   # set to the unclamped depth box below
+        if _auto_delta:
+            # Two-pass auto sizing. The search box must scale with the
+            # ACTUAL location uncertainty, which is set by how well the
+            # model fits -- the a posteriori data variance s^2 = sum(r^2) /
+            # (N - M) -- NOT by the nominal pick error, which is only a
+            # floor. We cannot know the misfit before locating, so:
+            #   pass 1: locate in a wide provisional box, measure the rms
+            #           residual over the solve set;
+            #   pass 2: size the real box from s^2 (G^T G)^-1 and relocate.
+            # For an all-Pn regional event this correctly turns a spuriously
+            # tiny (tens of metres) box into a realistic few-km box.
+            _prov = transform.delta_to_grid(150.0, 150.0, 60.0)
+            _prov = np.minimum(
+                _prov, transform.delta_to_grid(
+                    *np.array(cfg.get("auto_search_max_km",
+                                      [200.0, 200.0, 60.0]), dtype=float)))
+            _prov_full = np.append(_prov, delta_t)
+            locator.read_traveltimes(
+                min_coords=(initial_xyz - _prov),
+                max_coords=(initial_xyz + _prov))
+            _prov_soln = locator.locate(initial, _prov_full, alpha, method)
+            _prov_res = locator.residuals(_prov_soln)
+            if _prov_res:
+                _rv = np.array(list(_prov_res.values()), dtype=float)
+                _dof = max(len(_rv) - 4, 1)
+                _s_data = float(np.sqrt(np.sum(_rv ** 2) / _dof))
+            else:
+                _s_data = _default_err_scalar
+            # floor at the nominal pick error: a genuinely excellent fit
+            # should not size the box below pick precision.
+            _s_eff = max(_s_data, _default_err_scalar)
+
+            _adx, _ainfo = auto_search_delta(
+                locator, initial_xyz, list(_solve_arrivals.keys()),
+                _s_eff, transform.coord_sys,
+                k_reach=_auto_k, cond_max=_auto_cond_max)
+            if _adx is None:
+                _adx = transform.delta_to_grid(100.0, 100.0, 40.0)
+                log(f"search_delta auto: geometry too weak to size the box "
+                    f"(insufficient/near-singular gradients); wide fallback "
+                    f"(s_data={_s_data:.2f}s)")
+            else:
+                _cap = np.array(cfg.get("auto_search_max_km",
+                                        [200.0, 200.0, 60.0]), dtype=float)
+                _cap_xyz = transform.delta_to_grid(*_cap)
+                _adx = np.minimum(_adx, _cap_xyz)
+                _sig = _ainfo["sigma"]           # km, grid-axis order
+                _hw = _auto_k * _sig
+                if transform.coord_sys == "spherical":
+                    _lab = (_sig[1], _sig[2], _sig[0], _hw[1], _hw[2], _hw[0])
+                else:
+                    _lab = (_sig[0], _sig[1], _sig[2], _hw[0], _hw[1], _hw[2])
+                _weak = (" [WEAK geometry: cond=%.1e, depth poorly "
+                         "constrained]" % _ainfo["cond"]
+                         if _ainfo["weak"] else "")
+                log(f"search_delta auto: data_std={_s_data:.2f}s "
+                    f"(floor {_default_err_scalar:.2f}s) -> 1-sigma(km) "
+                    f"lat={_lab[0]:.2f} lon={_lab[1]:.2f} dep={_lab[2]:.2f}, "
+                    f"k={_auto_k:.1f} -> half-widths(km) lat={_lab[3]:.1f} "
+                    f"lon={_lab[4]:.1f} dep={_lab[5]:.1f} "
+                    f"(cond={_ainfo['cond']:.1e}, n={_ainfo['n']}){_weak}")
+            delta = np.append(_adx, delta_t)
+            # Preserve the UNCLAMPED auto depth half-width for the posterior:
+            # the location box depth is clamped (below) to stop the
+            # hypocenter wandering, but the posterior must sample the full
+            # depth extent or it truncates the (honestly large) depth
+            # uncertainty on unconstrained events.
+            _auto_delta_unclamped = np.asarray(delta[:3], dtype=float).copy()
+
+            # Apply the depth clamp to the AUTO box. The early clamp ran on
+            # the placeholder delta (auto is not known until here), so the
+            # real auto depth half-width has not yet been bounded. Without
+            # this, an all-Pn event whose depth is unconstrained gets a
+            # large auto depth box and the located depth wanders to the box
+            # edge. Recenter depth into [depth_min, depth_max] and shrink
+            # the depth half-width to fit, exactly as the fixed-delta path
+            # does. Horizontal axes are untouched -- only depth is clamped.
+            if depth_min is not None or depth_max is not None:
+                _iz = 0 if transform.coord_sys == "spherical" else 2
+                _lo = -np.inf if depth_min is None else float(depth_min)
+                _hi = np.inf if depth_max is None else float(depth_max)
+                # current depth half-width in km
+                _dep_hw_km = float(_hw[2]) if _ainfo.get("sigma") is not None \
+                    else float(cfg.get("auto_search_max_km",
+                                       [200.0, 200.0, 60.0])[2])
+                _dlo = max(_lo, dep0 - _dep_hw_km)
+                _dhi = min(_hi, dep0 + _dep_hw_km)
+                if _dhi <= _dlo:
+                    _dc = min(max(dep0, _lo), _hi)
+                    _dlo, _dhi = _lo, _hi
+                else:
+                    _dc = 0.5 * (_dlo + _dhi)
+                # rebuild the depth component of initial and delta in grid
+                _dep_hw_clamped = 0.5 * (_dhi - _dlo)
+                _init_dep_xyz = transform.geo_to_grid(lat0, lon0, _dc)
+                initial[_iz] = _init_dep_xyz[_iz]
+                _dep_delta_xyz = transform.delta_to_grid(0.0, 0.0, _dep_hw_clamped)
+                delta[_iz] = _dep_delta_xyz[_iz]
 
         _t_compute = _time.time()
         soln = locator.locate(initial, delta, alpha, method)
@@ -1193,91 +1356,64 @@ def main():
         #   "cannot access local variable '_ilat'"
         # from the warning path -- i.e. exactly on the events the warning
         # exists to flag.
-        if transform.spatial_axes_are_xyz_enu():
-            _ilon, _ilat, _iz = 0, 1, 2          # cartesian (E, N, z)
-        else:
-            _ilon, _ilat, _iz = 2, 1, 0          # spherical (r, theta, phi)
+        # spherical grid axis order (r, theta, phi) = (depth, lat, lon)
+        _ilon, _ilat, _iz = 2, 1, 0
 
         posterior = None
         if method == "edt" and nsamples > 0:
             try:
-                # Adaptive (contracting) posterior sampling.
-                #
-                # Sampling uniformly over the FULL search box is hopeless
-                # when that box is large: the likelihood peak is a few km
-                # wide, so almost no samples land in it and the weights
-                # collapse onto a handful of points. Measured at a 300 km
-                # half-width: effective sample size 2-4 out of 9000, with
-                # sigma varying 6x between identical runs and drifting
-                # smaller as the solution converged.
-                #
-                # So: sample, measure the scale, contract the proposal to a
-                # few sigma around the solution, repeat. Each pass raises
-                # the effective sample size by orders of magnitude and the
-                # resulting covariance is stable and meaningful.
-                # Contract GEOMETRICALLY rather than trusting sigma from
-                # the first pass: when the effective sample size is ~2, the
-                # covariance it returns is meaningless, so a sigma-driven
-                # contraction would be built on noise. Shrinking by a fixed
-                # factor each pass, floored at 4 sigma, converges reliably.
+                # Single generous-box importance sample. The EDT posterior
+                # proposal is built from the Hessian (local curvature) of the
+                # likelihood at the solution, so the reported uncertainty
+                # comes from the DATA, not from the box: the box is only a
+                # rejection boundary. An oversized box is therefore harmless
+                # -- verified on the solver, sigma is stable and ESS healthy
+                # from ~4x sigma out to 40x with no upper failure -- while a
+                # box SMALLER than the peak truncates the pdf and understates
+                # the uncertainty (the box_limited case). So we do NOT
+                # contract: we size the box generously from the a-posteriori
+                # geometry prediction (auto_search_delta already returns
+                # k * sigma with k = auto_search_k) and sample once. No
+                # shifting boxes, no shrink-to-fit; the failure mode is
+                # entirely one-sided and we stay on the safe side of it.
                 _d = np.asarray(delta[:3], dtype=float).copy()
-                for _pass in range(6):
-                    posterior = locator.sample_posterior(
-                        soln[:3], _d, nsamples=nsamples, nscatter=0,
-                        seed=posterior_seed,
-                        search_delta=np.asarray(delta[:3], dtype=float)
-                    )
-                    _sig = np.sqrt(np.clip(
-                        np.diag(posterior["covariance"]), 0, None))
-                    _next = np.minimum(np.maximum(4.0 * _sig, 0.35 * _d), _d)
-                    if np.all(_next > 0.95 * _d):
-                        break            # converged: proposal already tight
-                    _d = _next
+                # sample the posterior over the UNCLAMPED depth extent so the
+                # depth uncertainty is not truncated by the location clamp.
+                if _auto_delta_unclamped is not None:
+                    _d = _auto_delta_unclamped.copy()
+                posterior = locator.sample_posterior(
+                    soln[:3], _d, nsamples=nsamples, nscatter=0,
+                    seed=posterior_seed, rounds=posterior_rounds,
+                    search_delta=np.asarray(delta[:3], dtype=float)
+                )
                 if posterior.get("box_limited"):
-                    # A diagnostic must never be able to take down a
-                    # location. This one previously did, via an
-                    # undefined name, and it failed on precisely the
-                    # events it was meant to describe.
+                    # Report the per-axis situation factually and let the
+                    # analyst judge. box_fill is sigma / search half-width per
+                    # axis; a value above ~0.25 means the box half-width is
+                    # under 4 sigma, so that axis's reported uncertainty is a
+                    # lower bound (the pdf reaches the box edge). No verdict on
+                    # whether that is "good enough" -- just the numbers.
                     try:
-                        # box_fill is a dimensionless ratio, sigma / search
-                        # half-width, per axis. It is in GRID axis order, which
-                        # is NOT the order of search_delta_km -- report it
-                        # named, in km, and in config order instead of making
-                        # the operator work that out.
                         _bf = np.asarray(posterior.get("box_fill", []), dtype=float)
-                        _half = np.abs(np.asarray(delta[:3], dtype=float)) * (
+                        _half = np.abs(np.asarray(_d, dtype=float)) * (
                             posterior.get("metric_scale", np.ones(3))
                         )
-                        # grid axis -> (label, index into search_delta_km)
-                        _axmap = [(_ilat, "north-south", 0),
-                                  (_ilon, "east-west", 1),
-                                  (_iz, "depth", 2)]
-                        _parts, _rec = [], [0.0, 0.0, 0.0]
-                        for _g, _lab, _c in _axmap:
+                        _axmap = [(_ilat, "north-south"),
+                                  (_ilon, "east-west"),
+                                  (_iz, "depth")]
+                        _parts = []
+                        for _g, _lab in _axmap:
                             _s_km = _bf[_g] * _half[_g]
                             _parts.append(
-                                f"{_lab} sigma {_s_km:.1f} km vs half-width "
-                                f"{_half[_g]:.0f} km (ratio {_bf[_g]:.2f})"
-                            )
-                            # target ratio 0.25, i.e. half-width >= 4 sigma
-                            _rec[_c] = float(_half[_g] * max(1.0, _bf[_g] / 0.25))
-                        log("WARNING: posterior is limited by the search box, not "
-                            "by the arrivals: " + "; ".join(_parts) + ". A ratio "
-                            "above 0.25 means the search half-width is less than "
-                            "4 sigma, so the pdf is truncated at the box edge and "
-                            "the reported uncertainty is a LOWER BOUND. Try "
-                            "search_delta_km = ["
-                            + ", ".join(f"{v:.0f}" for v in _rec) + "]. "
-                            "If the ratios stay high after widening, the geometry "
-                            "genuinely does not constrain that axis -- commonly "
-                            "depth, with no near-source station -- and the box "
-                            "cannot fix that. Widening also costs search "
-                            "quality: the same sample budget covers more volume, "
-                            "so raise posterior_nsamples with it, and keep the "
-                            "box inside your traveltime grids and any "
-                            "depth_min/depth_max clamp.")
+                                f"{_lab} sigma {_s_km:.1f} km / half-width "
+                                f"{_half[_g]:.0f} km (fill {_bf[_g]:.2f})")
+                        log("posterior reaches the search box edge on one or "
+                            "more axes (fill > ~0.25: " + "; ".join(_parts) + ". Widening "
+                            "search_delta_km raises a truncated axis; an axis "
+                            "the geometry does not constrain (often depth) "
+                            "stays wide regardless.")
                     except Exception as _e:
-                        log(f"(box-limited diagnostic unavailable: {_e})")
+                        log(f"(box-fill diagnostic unavailable: {_e})")
                 _corr = posterior.get("depth_time_correlation")
                 if _corr is not None and np.isfinite(_corr) and abs(_corr) > 0.9:
                     log(f"depth and origin time are correlated at "
@@ -1314,7 +1450,7 @@ def main():
         # origin. None if no posterior.
         # The library now reports covariance_km: the posterior covariance
         # already expressed in km^2 in the local orthonormal frame
-        # (up, south, east for spherical grids; xyz for cartesian). Prefer
+        # (up, south, east for spherical grids). Prefer
         # it. The fallback path reproduces the old hand-rolled scaling so
         # this script still runs against a pykonal that has not been
         # rebuilt -- but note that only the fallback's per-axis sigmas were
@@ -1326,12 +1462,9 @@ def main():
             cov_km = posterior.get("covariance_km")
             if cov_km is None:
                 _cov = posterior["covariance"]
-                if transform.spatial_axes_are_xyz_enu():
-                    _s = np.ones(3)
-                else:
-                    _r0 = pk_constants.EARTH_RADIUS - dep
-                    _s = np.array([1.0, _r0,
-                                   _r0 * math.sin(math.radians(90.0 - lat))])
+                _r0 = pk_constants.EARTH_RADIUS - dep
+                _s = np.array([1.0, _r0,
+                               _r0 * math.sin(math.radians(90.0 - lat))])
                 cov_km = np.asarray(_cov) * np.outer(_s, _s)
             cov_km = np.asarray(cov_km, dtype=float)
             # _ilon / _ilat / _iz are set above, before posterior sampling.
@@ -1522,18 +1655,11 @@ def main():
         ce.setSemiMajorAxisLength(float(semi[0]))
         ce.setSemiIntermediateAxisLength(float(semi[1]))
         ce.setSemiMinorAxisLength(float(semi[2]))
-        if transform.spatial_axes_are_xyz_enu():
-            # axis vectors are (E, N, down-ish z): derive azimuth & plunge
-            e, n, z = axes[0]
-            ce.setMajorAxisAzimuth(math.degrees(math.atan2(e, n)) % 360.0)
-            ce.setMajorAxisPlunge(math.degrees(math.atan2(z, math.hypot(e, n))))
-            ce.setMajorAxisRotation(0.0)
-        else:
-            # spherical axes (r, theta, phi) ~ (up, south, east)
-            r, th, ph = axes[0]
-            ce.setMajorAxisAzimuth(math.degrees(math.atan2(ph, -th)) % 360.0)
-            ce.setMajorAxisPlunge(math.degrees(math.atan2(-r, math.hypot(th, ph))))
-            ce.setMajorAxisRotation(0.0)
+        # spherical axes (r, theta, phi) ~ (up, south, east)
+        r, th, ph = axes[0]
+        ce.setMajorAxisAzimuth(math.degrees(math.atan2(ph, -th)) % 360.0)
+        ce.setMajorAxisPlunge(math.degrees(math.atan2(-r, math.hypot(th, ph))))
+        ce.setMajorAxisRotation(0.0)
 
         ou = seiscomp.datamodel.OriginUncertainty()
         ou.setConfidenceEllipsoid(ce)

@@ -18,6 +18,7 @@ cdef class EQLocator(object):
     # NLL-style additions
     cdef dict                    cy_pick_errors
     cdef constants.REAL_t        cy_default_pick_error
+    cdef constants.REAL_t        cy_variance_floor
     cdef constants.REAL_t        cy_edt_exponent
     cdef constants.BOOL_t        cy_edt_ot_wt
     cdef constants.REAL_t        cy_edt_ot_wt_floor
