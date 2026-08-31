@@ -582,6 +582,16 @@ cdef class EQLocator(object):
         if npairs == 0 or stack <= 0.0:
             return -INFINITY
 
+        # Normalise by the pair count of the FULL arrival set, not the pairs
+        # that happen to be covered at this trial point. npairs is a function
+        # of position: as arrivals fall outside their grids the mean over the
+        # survivors rises, so the likelihood improves purely because the
+        # badly-fitting readings stopped being counted. This is the same
+        # discontinuity the exponent already avoids by using len(cy_keys)
+        # (see _effective_exponent); the divisor has to match.
+        # Can experiment with this on/off..
+        npairs = (n * (n - 1)) // 2
+
         if self.cy_edt_ot_wt:
             for ia in range(n):
                 tta = self.cy_tt_work[ia]
@@ -809,7 +819,8 @@ cdef class EQLocator(object):
         np.ndarray initial,
         np.ndarray delta,
         constants.REAL_t alpha=NAN,
-        str method="l1"
+        str method="l1",
+        np.ndarray bounds=None
     ):
         """
         Locate event using Differential Evolution followed by a Nelder-Mead
@@ -832,8 +843,18 @@ cdef class EQLocator(object):
         if not isnan(alpha):
             self.cy_alpha = alpha
 
-        min_coords = initial - delta
-        max_coords = initial + delta
+        if bounds is None:
+            min_coords = initial - delta
+            max_coords = initial + delta
+        else:
+            # Explicit, possibly ASYMMETRIC search interval: bounds[0] = lo,
+            # bounds[1] = hi, each a 4-vector (x, y, z, t0). Required wherever
+            # a physical limit truncates one side of the box -- writing that
+            # as centre +/- half-width reproduces the interval but silently
+            # moves the centre off the anchor.
+            bounds = np.asarray(bounds, dtype=np.float64)
+            min_coords = bounds[0].copy()
+            max_coords = bounds[1].copy()
 
         self.read_traveltimes(
             min_coords=min_coords[:3],
@@ -844,9 +865,7 @@ cdef class EQLocator(object):
             return self._locate_edt(initial, min_coords, max_coords)
 
         # the below is for the L1 solver only
-
         bounds = np.stack([min_coords, max_coords]).T
-
         soln = scipy.optimize.differential_evolution(self.rms, bounds,
                                                      x0 = initial,
                                                      strategy='best1bin', updating='immediate',
@@ -854,7 +873,6 @@ cdef class EQLocator(object):
                                                      popsize=20, atol=0.01, tol=0.01, init='sobol',
                                                      seed=self.cy_locate_seed,
                                                      polish=False)
-        #soln = scipy.optimize.differential_evolution(self.rms, bounds, strategy='best1bin') # original
 
         # Polish (find the bottom of the basin)
         polished = scipy.optimize.minimize(
@@ -906,7 +924,8 @@ cdef class EQLocator(object):
         n_stages = 7
         contract = 0.6
 
-        best_x = 0.5 * (lo + hi)
+        # Seed the incumbent at the ANCHOR, not the box centre.
+        best_x = np.clip(np.asarray(initial[:3], dtype=np.float64), lo, hi)
         best_f = self.edt(best_x)      # edt() returns NEGATIVE log-L (misfit)
 
         for stage in range(n_stages):
@@ -928,6 +947,9 @@ cdef class EQLocator(object):
         polished = scipy.optimize.minimize(
             self.edt, best_x,
             method='Nelder-Mead',
+            bounds=scipy.optimize.Bounds(
+                np.asarray(min_coords[:3], dtype=np.float64),
+                np.asarray(max_coords[:3], dtype=np.float64)),            
             options={'xatol': 0.05, 'fatol': 1e-4, 'maxiter': 200},
         )
         hypo = polished.x if polished.fun < best_f else best_x

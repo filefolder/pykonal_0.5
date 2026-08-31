@@ -88,7 +88,7 @@ def main():
     requests = {}
     skipped = {}
     clamped = set()
-    vertical_axis = 2 if transform.spatial_axes_are_xyz_enu() else 0
+    vertical_axis = 0 if getattr(transform, "coord_sys", "spherical") == "spherical" else 2
     for (net, sta), (lat, lon, elev) in sorted(stations.items()):
         grid_xyz = transform.geo_to_grid(lat, lon, -elev / 1000.0)
         for phase in sorted(extents):

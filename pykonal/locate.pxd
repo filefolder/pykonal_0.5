@@ -63,5 +63,6 @@ cdef class EQLocator(object):
         np.ndarray initial,
         np.ndarray delta,
         constants.REAL_t alpha=*,
-        str method=*
+        str method=*,
+        np.ndarray bounds=*
     )

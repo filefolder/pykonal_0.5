@@ -46,8 +46,7 @@ if not ARRIVALS:
 from pykonal.transformations import geo2sph
 if coord_sys == "spherical":
     initial_xyz = geo2sph(np.array([lat, lon, depth]))
-    delta = np.array([np.radians(2), np.radians(2), 25.0, 10.0])
-    initial = np.append(initial_xyz, 0.0)
+    delta = np.array([25.0, np.radians(2), np.radians(2), 10.0])
 else:
     initial = np.array([lon, lat, depth, 0.0])  # adjust to your projection
     delta = np.array([50., 50., 25., 10.])

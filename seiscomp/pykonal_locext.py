@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pykonal_locext.py — SeisComP LocExt wrapper for the pykonal_0.5 EDT locator.
+pykonal_locext.py — SeisComP LocExt wrapper for the PyKonal-EDT locator.
 
 SeisComP's ExternalLocator (plugin: locext) calls this script with a
 SeisComP XML EventParameters document on stdin (one origin + its picks)
@@ -204,6 +204,22 @@ def clamp_to_grid(coords, lo, hi, vertical_axis):
     c[vertical_axis] = min(max(c[vertical_axis], lo[vertical_axis]),
                            hi[vertical_axis])
     return c
+
+
+def _read_volume(initial, delta, bounds):
+    """
+    The (min, max) grid coordinates actually searched. `bounds`, when set,
+    is an explicit asymmetric interval and overrides initial +/- delta;
+    when None (fixed search_delta_km, or no depth clamp configured) the
+    symmetric box applies. Reading a different volume than was searched
+    leaves arrivals with no traveltime at the solution, which then look
+    like rejected outliers in the output.
+    """
+    if bounds is None:
+        return (np.asarray(initial - delta, dtype=float)[:3],
+                np.asarray(initial + delta, dtype=float)[:3])
+    return (np.asarray(bounds[0], dtype=float)[:3],
+            np.asarray(bounds[1], dtype=float)[:3])
 
 
 def auto_search_delta(locator, initial_xyz, arrival_keys, sigma_s,
@@ -708,7 +724,7 @@ def main():
         return _default_err_scalar
     delta_km = cfg.get("search_delta_km", [30.0, 30.0, 15.0])
     _auto_delta = isinstance(delta_km, str) and delta_km.lower() == "auto"
-    _auto_k = float(cfg.get("auto_search_k", 6.0))
+    _auto_k = float(cfg.get("auto_search_k_sigma", 4.0))
     _auto_cond_max = float(cfg.get("auto_search_cond_max", 1.0e6))
     if _auto_delta:
         delta_km = [50.0, 50.0, 25.0]   # placeholder; recomputed per event
@@ -798,8 +814,11 @@ def main():
         if dep0 is None:
             dep0 = float(cfg.get("default_depth", 10.0))
 
+    depth_min = cfg.get("depth_min")
+    depth_max = cfg.get("depth_max")
     if args.fixed_depth is not None:
-        dep0 = args.fixed_depth
+        depth_min = float(args.fixed_depth) - 0.1
+        depth_max = float(args.fixed_depth) + 0.1
 
     # Diagnostic: fingerprint the INPUT to this call. If two successive
     # relocations differ, comparing these lines shows whether scolv fed
@@ -1172,6 +1191,7 @@ def main():
 
         # ----- automatic, geometry-based search box (search_delta_km: auto)
         _auto_delta_unclamped = None   # set to the unclamped depth box below
+        _search_bounds = None
         if _auto_delta:
             # Two-pass auto sizing. The search box must scale with the
             # ACTUAL location uncertainty, which is set by how well the
@@ -1204,35 +1224,194 @@ def main():
             # should not size the box below pick precision.
             _s_eff = max(_s_data, _default_err_scalar)
 
+            # ---- measured sigma from a cheap posterior in the provisional box
+            # C = s^2 (G^T G)^-1 assumes INDEPENDENT residuals. In a region
+            # the 1D model does not fit, residuals trend with distance: the
+            # effective number of independent observations is far below N and
+            # sqrt(N) scaling overstates the precision, worst on depth, which
+            # is the axis that trades against origin time. Measuring the
+            # posterior drops the assumption instead of trying to correct it.
+            _meas_sig = None
+            _prov_n = int(cfg.get("auto_search_posterior_nsamples", 512))
+            if method == "edt" and _prov_n > 0:
+                try:
+                    _pp = locator.sample_posterior(
+                        _prov_soln[:3], _prov, nsamples=_prov_n, nscatter=0,
+                        seed=posterior_seed, rounds=2)
+                    _s = np.sqrt(np.clip(
+                        np.diag(np.asarray(_pp["covariance_km"], float)),
+                        0.0, None))
+                    _pess = float(_pp.get("ess", float("nan")))
+                    _pmc = _pp.get("sigma_rel_mcse")
+                    _pmc = float("nan") if _pmc is None else float(_pmc)
+                    _ess_min = float(cfg.get("auto_search_posterior_min_ess", 25)) # TODO add config?
+                    # a 512-sample posterior can itself be under-resolved;
+                    # only trust it if it actually converged
+                    if np.all(np.isfinite(_s)) and _s.min() > 0 \
+                            and _pess >= _ess_min \
+                            and (not np.isfinite(_pmc) or _pmc < 0.5):
+                        _meas_sig = _s
+                        _edge = np.asarray(_pp.get("at_search_edge",
+                                                   [False] * 3), dtype=bool)
+                        if _edge.any():
+                            _en = [n for n, e in zip(
+                                ("depth", "north-south", "east-west")
+                                if transform.coord_sys == "spherical"
+                                else ("north-south", "east-west", "depth"),
+                                _edge) if e]
+                            log("search_delta auto: provisional solution sits "
+                                "against the searched edge on " +
+                                ", ".join(_en) + " -- the likelihood is "
+                                "monotone there and the data do not locate "
+                                "that axis at all")
+                    else:
+                        log(f"search_delta auto: provisional posterior not "
+                            f"usable for sizing (ess={_pess:.0f}, "
+                            f"mcse={_pmc:.2f}); using the geometry prediction")
+                except Exception as _e:
+                    log(f"search_delta auto: provisional posterior failed "
+                        f"({_e}); using the geometry prediction")
+
+
             _adx, _ainfo = auto_search_delta(
                 locator, initial_xyz, list(_solve_arrivals.keys()),
                 _s_eff, transform.coord_sys,
                 k_reach=_auto_k, cond_max=_auto_cond_max)
-            if _adx is None:
-                _adx = transform.delta_to_grid(100.0, 100.0, 40.0)
-                log(f"search_delta auto: geometry too weak to size the box "
-                    f"(insufficient/near-singular gradients); wide fallback "
-                    f"(s_data={_s_data:.2f}s)")
-            else:
-                _cap = np.array(cfg.get("auto_search_max_km",
-                                        [200.0, 200.0, 60.0]), dtype=float)
-                _cap_xyz = transform.delta_to_grid(*_cap)
-                _adx = np.minimum(_adx, _cap_xyz)
-                _sig = _ainfo["sigma"]           # km, grid-axis order
-                _hw = _auto_k * _sig
-                if transform.coord_sys == "spherical":
-                    _lab = (_sig[1], _sig[2], _sig[0], _hw[1], _hw[2], _hw[0])
+
+            _cap = np.array(cfg.get("auto_search_max_km",
+                                    [200.0, 200.0, 60.0]), dtype=float)
+            _cap_xyz = transform.delta_to_grid(*_cap)
+
+            # Fall back to a wide SIGMA, never to a wide box. The old
+            # fallback assigned _adx directly and so bypassed the cap, the
+            # floors and the measured posterior, and left _hw undefined --
+            # which sent the depth clamp to auto_search_max_km[2] (60 km)
+            # while the box it was clamping was 40 km. One sizing path from
+            # here down removes that whole class of mismatch.
+            _sig_pred = _ainfo.get("sigma")   # km, grid-axis order, or None
+            if _sig_pred is None:
+                if _meas_sig is not None:
+                    _sig = _meas_sig
+                    _why = ("geometry unusable; sized from the measured "
+                            "provisional posterior")
                 else:
-                    _lab = (_sig[0], _sig[1], _sig[2], _hw[0], _hw[1], _hw[2])
-                _weak = (" [WEAK geometry: cond=%.1e, depth poorly "
-                         "constrained]" % _ainfo["cond"]
-                         if _ainfo["weak"] else "")
-                log(f"search_delta auto: data_std={_s_data:.2f}s "
-                    f"(floor {_default_err_scalar:.2f}s) -> 1-sigma(km) "
-                    f"lat={_lab[0]:.2f} lon={_lab[1]:.2f} dep={_lab[2]:.2f}, "
-                    f"k={_auto_k:.1f} -> half-widths(km) lat={_lab[3]:.1f} "
-                    f"lon={_lab[4]:.1f} dep={_lab[5]:.1f} "
-                    f"(cond={_ainfo['cond']:.1e}, n={_ainfo['n']}){_weak}")
+                    _fb = np.array(cfg.get("auto_search_fallback_sigma_km",
+                                           [15.0, 15.0, 15.0]), dtype=float)
+                    if transform.coord_sys == "spherical":
+                        _fb = _fb[[2, 0, 1]]    # (lat,lon,dep) -> (dep,lat,lon)
+                    _sig = _fb
+                    _why = ("geometry unusable and no measured posterior; "
+                            "wide default sigma")
+                log(f"search_delta auto: {_why} (insufficient or "
+                    f"near-singular gradients, s_data={_s_data:.2f}s)")
+            elif _meas_sig is not None:
+                # Take the LARGER per axis: the failure mode is one-sided.
+                _sig = np.maximum(_sig_pred, _meas_sig)
+            else:
+                _sig = _sig_pred
+
+            _hw = _auto_k * _sig
+
+            # --- floor 1: the box must contain the provisional solution.
+            # Pass 1 searched +/-150 km and pass 2 searches +/-k*sigma
+            # around the SAME anchor, with nothing checking that the
+            # second contains the first. Where the provisional pass moved
+            # the event a long way, a tight auto box centred back on the
+            # anchor cannot reach it, and (with the anchor now seeding the
+            # search) the result is a confident location at the anchor.
+            _pg = transform.grid_to_geo(_prov_soln[:3])   # lat, lon, dep
+            _off_lat = abs(_pg[0] - lat0) * 111.195
+            _off_lon = abs(_pg[1] - lon0) * 111.195 * \
+                math.cos(math.radians(lat0))
+            _off_dep = abs(_pg[2] - dep0)
+            if transform.coord_sys == "spherical":
+                _off = np.array([_off_dep, _off_lat, _off_lon])
+            else:
+                _off = np.array([_off_lat, _off_lon, _off_dep])
+            _hw_cov = 1.5 * _off + _sig      # offset plus a sigma margin
+
+            # --- floor 2: depth cannot be resolved much better than the
+            # nearest station offset. Beyond roughly one focal depth the
+            # takeoff angle stops changing with depth and the arrival
+            # constrains origin time instead. Heuristic, not derived, but
+            # it is what stops a clean event with no near station from
+            # getting a 2 km depth box around a depth nothing measured.
+            _dmin_km = np.inf
+            for _k in {k[:2] for k in _solve_arrivals}:
+                _st = stations.get(_k)
+                if _st is None:
+                    continue
+                _dd, _ = gc_distance_azimuth(lat0, lon0, _st[0], _st[1])
+                _dmin_km = min(_dmin_km, _dd * 111.195)
+            _iz_km = 0 if transform.coord_sys == "spherical" else 2
+            _hw_geom = np.zeros(3)
+            if np.isfinite(_dmin_km):
+                _hw_geom[_iz_km] = float(
+                    cfg.get("auto_search_depth_dist_factor", 0.5)) * _dmin_km
+
+            # --- floor 3: absolute minima, so no path can produce a box
+            # narrower than the model and grid can meaningfully resolve.
+            _hw_abs = np.array(cfg.get("auto_search_min_km",
+                                       [2.0, 2.0, 5.0]), dtype=float)
+            if transform.coord_sys == "spherical":
+                _hw_abs = _hw_abs[[2, 0, 1]]   # -> (dep, lat, lon)
+
+            _hw_raw = _hw.copy()
+            _hw = np.maximum.reduce([_hw, _hw_cov, _hw_geom, _hw_abs])
+            _floored = [n for n, a, b in zip(
+                ("depth", "north-south", "east-west")
+                if transform.coord_sys == "spherical"
+                else ("north-south", "east-west", "depth"),
+                _hw_raw, _hw) if b > a + 1e-6]
+            if _floored:
+                log("search_delta auto: half-width floored on "
+                    + ", ".join(_floored)
+                    + f" (k*sigma would have given "
+                    + "/".join(f"{v:.1f}" for v in _hw_raw)
+                    + " km, using "
+                    + "/".join(f"{v:.1f}" for v in _hw) + " km)")
+
+            # Cap in km
+            _cap_km = _cap.copy()
+            if transform.coord_sys == "spherical":
+                _cap_km = _cap_km[[2, 0, 1]]     # (lat,lon,dep) -> (dep,lat,lon)
+            _capped = [n for n, a, c in zip(
+                ("depth", "north-south", "east-west")
+                if transform.coord_sys == "spherical"
+                else ("north-south", "east-west", "depth"),
+                _hw, _cap_km) if a > c + 1e-6]
+            _hw = np.minimum(_hw, _cap_km)
+            if _capped:
+                log("search_delta auto: half-width capped by "
+                    "auto_search_max_km on " + ", ".join(_capped)
+                    + " (using " + "/".join(f"{v:.1f}" for v in _hw) + " km)")
+
+            # rebuild the grid-unit half-widths from the combined sigma
+            if transform.coord_sys == "spherical":
+                _adx = transform.delta_to_grid(_hw[1], _hw[2], _hw[0])
+            else:
+                _adx = transform.delta_to_grid(_hw[0], _hw[1], _hw[2])
+            _adx = np.minimum(_adx, _cap_xyz)
+
+            if transform.coord_sys == "spherical":
+                _lab = (_sig[1], _sig[2], _sig[0], _hw[1], _hw[2], _hw[0])
+            else:
+                _lab = (_sig[0], _sig[1], _sig[2], _hw[0], _hw[1], _hw[2])
+            _cd = _ainfo.get("cond", float("inf"))
+            _weak = ("" if not _ainfo.get("weak") else
+                     " [WEAK geometry: cond=%s, depth poorly constrained]"
+                     % ("undefined" if not np.isfinite(_cd) else "%.1e" % _cd))
+            _mr = ("" if (_meas_sig is None or _sig_pred is None) else
+                   " measured/predicted sigma ratio " +
+                   "/".join(f"{m/max(p,1e-6):.1f}"
+                            for m, p in zip(_meas_sig, _sig_pred)))
+            log(f"search_delta auto: data_std={_s_data:.2f}s "
+                f"(floor {_default_err_scalar:.2f}s) -> 1-sigma(km) "
+                f"lat={_lab[0]:.2f} lon={_lab[1]:.2f} dep={_lab[2]:.2f}, "
+                f"k={_auto_k:.1f} -> half-widths(km) lat={_lab[3]:.1f} "
+                f"lon={_lab[4]:.1f} dep={_lab[5]:.1f} "
+                f"(cond={'undefined' if not np.isfinite(_cd) else '%.1e' % _cd}"
+                f", n={_ainfo['n']}){_weak}{_mr}")
             delta = np.append(_adx, delta_t)
             # Preserve the UNCLAMPED auto depth half-width for the posterior:
             # the location box depth is clamped (below) to stop the
@@ -1254,25 +1433,32 @@ def main():
                 _lo = -np.inf if depth_min is None else float(depth_min)
                 _hi = np.inf if depth_max is None else float(depth_max)
                 # current depth half-width in km
-                _dep_hw_km = float(_hw[2]) if _ainfo.get("sigma") is not None \
-                    else float(cfg.get("auto_search_max_km",
-                                       [200.0, 200.0, 60.0])[2])
+                _dep_hw_km = float(_hw[_iz])
                 _dlo = max(_lo, dep0 - _dep_hw_km)
                 _dhi = min(_hi, dep0 + _dep_hw_km)
                 if _dhi <= _dlo:
-                    _dc = min(max(dep0, _lo), _hi)
                     _dlo, _dhi = _lo, _hi
-                else:
-                    _dc = 0.5 * (_dlo + _dhi)
-                # rebuild the depth component of initial and delta in grid
-                _dep_hw_clamped = 0.5 * (_dhi - _dlo)
-                _init_dep_xyz = transform.geo_to_grid(lat0, lon0, _dc)
-                initial[_iz] = _init_dep_xyz[_iz]
-                _dep_delta_xyz = transform.delta_to_grid(0.0, 0.0, _dep_hw_clamped)
-                delta[_iz] = _dep_delta_xyz[_iz]
+                # Keep `initial` ON THE ANCHOR and carry the truncated depth
+                # interval as explicit asymmetric bounds.
+                _blo = (initial - delta)[:3].copy()
+                _bhi = (initial + delta)[:3].copy()
+                # depth increases downward in geo, but axis 0 of a spherical
+                # grid is radius, which decreases downward -- convert both
+                # ends and order them, do not assume the sign.
+                _g1 = transform.geo_to_grid(lat0, lon0, _dlo)[_iz]
+                _g2 = transform.geo_to_grid(lat0, lon0, _dhi)[_iz]
+                _blo[_iz], _bhi[_iz] = min(_g1, _g2), max(_g1, _g2)
+                _search_bounds = np.stack([
+                    np.append(_blo, initial[3] - delta[3]),
+                    np.append(_bhi, initial[3] + delta[3]),
+                ])
+                log(f"depth clamp: search interval {_dlo:.1f} to {_dhi:.1f} km"
+                    f" (anchor {dep0:.1f} km, half-width {_dep_hw_km:.1f} km);"
+                    f" anchor retained, interval asymmetric by "
+                    f"{abs((_dhi - dep0) - (dep0 - _dlo)):.1f} km")
 
         _t_compute = _time.time()
-        soln = locator.locate(initial, delta, alpha, method)
+        soln = locator.locate(initial, delta, alpha, method, bounds=_search_bounds)
 
         # Residuals for ALL arrivals at the final hypocenter, not just the
         # solve set: a residual is observed - predicted at the fixed
@@ -1286,8 +1472,8 @@ def main():
             # only loaded the solve-set grids, so re-read for the full set
             # (same search box) or the far arrivals come back with no
             # residual and get nulled in the output.
-            locator.read_traveltimes(min_coords=(initial - delta)[:3],
-                                     max_coords=(initial + delta)[:3])
+            _rt_lo, _rt_hi = _read_volume(initial, delta, _search_bounds)
+            locator.read_traveltimes(min_coords=_rt_lo, max_coords=_rt_hi)
         residuals = locator.residuals(soln)
 
         # ------------------------------------------------ outlier rejection
@@ -1333,19 +1519,33 @@ def main():
                 locator.clear_arrivals()
                 locator.add_arrivals(_solve_arrivals)
                 locator.add_pick_errors(_solve_pick_errors)
-                soln = locator.locate(initial, delta, alpha, method)
+                soln = locator.locate(initial, delta, alpha, method, bounds=_search_bounds)
                 # residuals over ALL remaining arrivals at the new solution
                 if _solve_arrivals is not arrivals:
                     locator.clear_arrivals()
                     locator.add_arrivals(arrivals)
                     locator.add_pick_errors(pick_errors)
-                    locator.read_traveltimes(min_coords=(initial - delta)[:3],
-                                             max_coords=(initial + delta)[:3])
+                    _rt_lo, _rt_hi = _read_volume(initial, delta,
+                                                  _search_bounds)
+                    locator.read_traveltimes(min_coords=_rt_lo,
+                                             max_coords=_rt_hi)
                 residuals = locator.residuals(soln)
             if _excluded:
                 log(f"rejected {len(_excluded)} outlier arrival(s) "
                     f"(cutoff {_cut:.2f} s): "
                     f"{', '.join('.'.join(k) for k in _excluded)}")
+
+        # Arrivals with no traveltime at the solution: their grid does not cover
+        # the point, so they contributed nothing to the fit. These are emitted
+        # with weight 0 and timeUsed false (identical to a rejected outlier)
+        # so without this they are indistinguishable in scolv from a pick the
+        # locator judged bad, when in fact it was never evaluated.
+        _uncovered = sorted(set(arrivals) - set(residuals))
+        if _uncovered:
+            log(f"{len(_uncovered)} arrival(s) have no traveltime at the solution "
+                f"and did not contribute to the fit (grid does not cover the "
+                f"hypocenter): {', '.join('.'.join(k) for k in _uncovered)}. These "
+                f"are reported with weight 0, the same as rejected outliers.")
 
         quality = locator.quality(soln)
 
@@ -1373,7 +1573,7 @@ def main():
                 # the uncertainty (the box_limited case). So we do NOT
                 # contract: we size the box generously from the a-posteriori
                 # geometry prediction (auto_search_delta already returns
-                # k * sigma with k = auto_search_k) and sample once. No
+                # k * sigma with k = auto_search_k_sigma) and sample once. No
                 # shifting boxes, no shrink-to-fit; the failure mode is
                 # entirely one-sided and we stay on the safe side of it.
                 _d = np.asarray(delta[:3], dtype=float).copy()
