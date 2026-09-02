@@ -82,7 +82,7 @@ cdef class EQLocator(object):
         # input yields the same solution across repeated calls / processes
         # (e.g. scolv relocating twice). Set locate_seed=None for the old
         # nondeterministic behavior.
-        self.cy_locate_seed         = 12345
+        self.cy_locate_seed         = None
         self.cy_keys                = None
         self.cy_tt_fields           = None
 

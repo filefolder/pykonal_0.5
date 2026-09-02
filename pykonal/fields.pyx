@@ -635,9 +635,10 @@ cdef class ScalarField3D(Field3D):
                 # phi = 2*pi + 0.1) are handled correctly instead of being
                 # spuriously rejected or mis-interpolated at the seam.
                 span = self.cy_max_coords[iax] + self.cy_node_intervals[iax] - self.cy_min_coords[iax]
-                pt_iax = self.cy_min_coords[iax] + (
-                    (pt_iax - self.cy_min_coords[iax]) % span
-                )
+                pt_iax = (pt_iax - self.cy_min_coords[iax]) % span
+                if pt_iax < 0:
+                    pt_iax = pt_iax + span
+                pt_iax = self.cy_min_coords[iax] + pt_iax
             elif (
                 (pt_iax < self.cy_min_coords[iax] or pt_iax > self.cy_max_coords[iax])
                 and not self.cy_iax_isnull[iax]

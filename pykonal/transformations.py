@@ -13,7 +13,7 @@ import numpy as np
 
 from . import constants
 
-# this is more accurate, but requires a rebuild of our models / TODO
+# this is more accurate
 def geo2sph(nodes):
     """
     Transform geographical coordinates to new spherical coordinates system.
@@ -105,7 +105,7 @@ def xyz2sph(nodes, origin=(0,0,0), force_phi_positive=False):
     return rtp
 
 
-# this is more accurate, but requires a rebuild of our models / TODO
+# this is more accurate
 def sph2geo(nodes):
     """
     Transform spherical coordinates to new geographical coordinate system.
