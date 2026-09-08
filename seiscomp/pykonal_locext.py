@@ -694,6 +694,7 @@ def main():
         cfg = json.load(f)
 
     transform = GeoTransform(cfg)
+    _IZ = 0 if transform.coord_sys == "spherical" else 2    
     method = cfg.get("method", "edt")
     alpha = float(cfg.get("alpha", 0.01))
     alpha = np.maximum(alpha,1e-5)
@@ -816,9 +817,14 @@ def main():
 
     depth_min = cfg.get("depth_min")
     depth_max = cfg.get("depth_max")
+    # If fixed, actually just constrain the min/max plus some fudge
     if args.fixed_depth is not None:
-        depth_min = float(args.fixed_depth) - 0.1
-        depth_max = float(args.fixed_depth) + 0.1
+        # The box CENTER is what gets pinned, so a +/- window around some
+        # other dep0 pinned the wrong value. Config clamps are dropped: the
+        # tolerance window below is the constraint now, and leaving them set
+        # would re-center dep0 off the pinned depth at the block near 947.
+        dep0 = float(args.fixed_depth)
+        depth_min = depth_max = None
 
     # Diagnostic: fingerprint the INPUT to this call. If two successive
     # relocations differ, comparing these lines shows whether scolv fed
@@ -942,8 +948,6 @@ def main():
     # elevation), where a negative-depth solution is valid. When set, the
     # symmetric search box (initial +/- delta) is recentered and its depth
     # half-width shrunk to fit [depth_min, depth_max].
-    depth_min = cfg.get("depth_min")
-    depth_max = cfg.get("depth_max")
     if depth_min is not None or depth_max is not None:
         lo_bound = -np.inf if depth_min is None else float(depth_min)
         hi_bound = np.inf if depth_max is None else float(depth_max)
@@ -958,10 +962,18 @@ def main():
 
     initial_xyz = transform.geo_to_grid(lat0, lon0, dep0)
     delta_xyz = transform.delta_to_grid(*[float(d) for d in delta_km])
+    # Depth half-width the posterior should sample: the extent the data
+    # would have been allowed, BEFORE any pin. Depth uncertainty is a
+    # property of the geometry, not of the operator's constraint.
+    _post_depth_hw = float(delta_xyz[_IZ])
     if args.fixed_depth is not None:
-        # pin depth by collapsing the search interval on the depth axis
-        iz = 0 if transform.coord_sys == "spherical" else 2
-        delta_xyz[iz] = 1e-3
+        # must stay > 0: TraveltimeInventory.read rejects min >= max
+        _tol_km = max(float(cfg.get("fixed_depth_tolerance_km", 2.0)), 1e-3)
+        # delta_to_grid takes (dlat_km, dlon_km, ddep_km) and leaves depth in
+        # km on the radial axis, so index _IZ is the tolerance in grid units
+        delta_xyz[_IZ] = abs(transform.delta_to_grid(0.0, 0.0, _tol_km)[_IZ])
+        log(f"fixed depth {args.fixed_depth:.2f} km, search tolerance "
+            f"+/-{_tol_km:.2f} km; posterior depth half-width {_post_depth_hw:.1f} km")
 
     initial = np.append(initial_xyz, 0.0)
     delta = np.append(delta_xyz, delta_t)
@@ -1419,6 +1431,11 @@ def main():
             # depth extent or it truncates the (honestly large) depth
             # uncertainty on unconstrained events.
             _auto_delta_unclamped = np.asarray(delta[:3], dtype=float).copy()
+            # the auto box is the data-driven extent -> what depth should sample
+            _post_depth_hw = float(_auto_delta_unclamped[_IZ])
+            if args.fixed_depth is not None:
+                _tol_km = max(float(cfg.get("fixed_depth_tolerance_km", 2.0)), 1e-3)
+                delta[_IZ] = abs(transform.delta_to_grid(0.0, 0.0, _tol_km)[_IZ])
 
             # Apply the depth clamp to the AUTO box. The early clamp ran on
             # the placeholder delta (auto is not known until here), so the
@@ -1473,7 +1490,13 @@ def main():
             # (same search box) or the far arrivals come back with no
             # residual and get nulled in the output.
             _rt_lo, _rt_hi = _read_volume(initial, delta, _search_bounds)
-            locator.read_traveltimes(min_coords=_rt_lo, max_coords=_rt_hi)
+            # The posterior samples a wider depth extent than the location
+            # box. Traveltimes are read only here, and a sample with no
+            # traveltime is silently rejected -- which truncates exactly the
+            # depth uncertainty we are preserving. Widen the read to cover it.
+            _pad = np.zeros(3)
+            _pad[_IZ] = max(0.0, _post_depth_hw - abs(float(delta[_IZ])))
+            locator.read_traveltimes(min_coords=_rt_lo - _pad, max_coords=_rt_hi + _pad)
         residuals = locator.residuals(soln)
 
         # ------------------------------------------------ outlier rejection
@@ -1559,6 +1582,20 @@ def main():
         # spherical grid axis order (r, theta, phi) = (depth, lat, lon)
         _ilon, _ilat, _iz = 2, 1, 0
 
+        # locate() re-reads traveltimes over its OWN search box every call,
+        # so whatever the padded read below/above loaded has since been
+        # replaced by the (narrow, pinned) location box. The posterior
+        # samples a wider depth extent than that, and a sample with no
+        # traveltime is silently rejected -- which truncates exactly the
+        # depth uncertainty we are preserving. Re-read unconditionally here,
+        # after the last locate(), covering the posterior extent.
+        _pad = np.zeros(3)
+        _pad[_IZ] = max(0.0, _post_depth_hw - abs(float(delta[_IZ])))
+        if _pad[_IZ] > 0.0:
+            _rt_lo, _rt_hi = _read_volume(initial, delta, _search_bounds)
+            locator.read_traveltimes(min_coords=_rt_lo - _pad,
+                                     max_coords=_rt_hi + _pad)
+
         posterior = None
         if method == "edt" and nsamples > 0:
             try:
@@ -1577,14 +1614,23 @@ def main():
                 # shifting boxes, no shrink-to-fit; the failure mode is
                 # entirely one-sided and we stay on the safe side of it.
                 _d = np.asarray(delta[:3], dtype=float).copy()
-                # sample the posterior over the UNCLAMPED depth extent so the
-                # depth uncertainty is not truncated by the location clamp.
                 if _auto_delta_unclamped is not None:
                     _d = _auto_delta_unclamped.copy()
+                # Depth: always sample the UNPINNED extent. Under
+                # --fixed-depth the location box is only
+                # +/-fixed_depth_tolerance_km, and sampling that would report
+                # a depth sigma of roughly the tolerance -- an artefact of the
+                # operator's constraint, not a measurement.
+                _d[_IZ] = max(float(_d[_IZ]), _post_depth_hw)
+                # box_fill is measured against search_delta; report the depth
+                # axis against what was actually sampled, or the box_limited
+                # warning fires on every pinned relocation.
+                _sd = np.asarray(delta[:3], dtype=float).copy()
+                _sd[_IZ] = _d[_IZ]
                 posterior = locator.sample_posterior(
                     soln[:3], _d, nsamples=nsamples, nscatter=0,
                     seed=posterior_seed, rounds=posterior_rounds,
-                    search_delta=np.asarray(delta[:3], dtype=float)
+                    search_delta=_sd
                 )
                 if posterior.get("box_limited"):
                     # Report the per-axis situation factually and let the
@@ -1642,6 +1688,12 @@ def main():
 
         # traveltimes for per-arrival predicted times were already read
         lat, lon, dep = transform.grid_to_geo(soln[:3])
+        # NOTE: the solved depth is reported as-is, NOT snapped to
+        # args.fixed_depth. With fixed_depth_tolerance_km > 0 the solver is
+        # allowed off the pin, and the residuals, arrival distances and
+        # origin time all correspond to the solved depth; overwriting it
+        # would make the reported depth inconsistent with the rest of the
+        # origin. The pin is enforced by the search box, not by the output.
         t0 = seiscomp.core.Time(epoch) + seiscomp.core.TimeSpan(float(soln[3]))
 
         # Uncertainties in km from the EDT posterior covariance, at the
