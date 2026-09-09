@@ -2,17 +2,16 @@
 # distutils: language=c++
 # cython: profile=False
 
-
 import numpy as np
 import os
 import pykonal
-import scipy.optimize
 import tempfile
 
 from . import constants as _constants
 from . import inventory as _inventory
 from . import solver as _solver
 from . import transformations as _transformations
+from . import nelder_mead as _neldermead
 
 cimport numpy as np
 
@@ -952,6 +951,7 @@ cdef class EQLocator(object):
             return self._locate_edt(initial, min_coords, max_coords)
 
         # the below is for the L1 solver only
+        import scipy.optimize # only import when required (L1, not EDT)
         bounds = np.stack([min_coords, max_coords]).T
         soln = scipy.optimize.differential_evolution(self.rms, bounds,
                                                      x0 = initial,
@@ -1031,10 +1031,11 @@ cdef class EQLocator(object):
             hi = np.minimum(best_x + half, np.asarray(max_coords[:3]))
 
         # local polish to sub-node precision around the sampled mode
-        polished = scipy.optimize.minimize(
+        # NOTE we are using a local clone of the scipy.optimize nelder-mead to speed things up
+        polished = _neldermead.minimize(
             self.edt, best_x,
             method='Nelder-Mead',
-            bounds=scipy.optimize.Bounds(
+            bounds=_neldermead.Bounds(
                 np.asarray(min_coords[:3], dtype=np.float64),
                 np.asarray(max_coords[:3], dtype=np.float64)),            
             options={'xatol': 0.05, 'fatol': 1e-4, 'maxiter': 200},
