@@ -87,6 +87,9 @@ cdef class EQLocator(object):
         self.cy_tt_fields           = None
 
         self.cy_edge_axes = None
+        self.cy_tt_box_min = None
+        self.cy_tt_box_max = None
+        self.cy_tt_box_keys = None
         self.cy_traveltime_inventory = None
         inventory = _inventory.TraveltimeInventory(traveltime_inventory, mode="r")
         self.cy_traveltime_inventory = inventory
@@ -367,11 +370,34 @@ cdef class EQLocator(object):
     def locate_seed(self, value):
         self.cy_locate_seed = value
 
+
     cpdef constants.BOOL_t read_traveltimes(
         EQLocator self, 
         constants.REAL_t[:] min_coords=None, 
         constants.REAL_t[:] max_coords=None
     ):
+        """
+        Load a traveltime field per arrival from the inventory.
+
+        Reuses what is already in memory when this request asks for no more
+        than the previous one did. Motivation: locate() calls this on every
+        invocation, and a single relocation typically calls locate() three
+        to six times (a provisional pass, a final pass, then once per
+        outlier-rejection pass) with boxes that only ever shrink. With a
+        sharded inventory each read opens one HDF5 file per arrival, so the
+        repeats dominate wall time on network storage.
+
+        NOTE: wider is not always identical in effect. The EDT Hessian
+        stencil flags an axis as `edge` when a stencil point falls outside
+        the LOADED field, so a cached wider field can flag fewer edges and
+        give a better-conditioned proposal than a fresh narrow read would.
+        That is an improvement, but it does make results depend on read
+        history. Set strict=True below to reuse only on an exact box match
+        if you need to reproduce the uncached numbers.
+        """
+        requested = frozenset(self.cy_arrivals)
+        if self._tt_cache_covers(requested, min_coords, max_coords):
+            return True
 
         inventory = self.cy_traveltime_inventory
         self.cy_traveltimes = {}
@@ -396,10 +422,71 @@ cdef class EQLocator(object):
                 stacklevel=2
             )
 
+        # Record what is now in memory. Keys include the ones with no grid
+        # in the inventory: they are permanently absent, and leaving them
+        # out would make every later call miss and re-read.
+        self.cy_tt_box_min = (None if min_coords is None
+                              else np.array(min_coords, dtype=np.float64))
+        self.cy_tt_box_max = (None if max_coords is None
+                              else np.array(max_coords, dtype=np.float64))
+        self.cy_tt_box_keys = requested
+
         # traveltime grids changed; flattened workspace is stale
         self.cy_keys = None
         self.cy_tt_fields = None
 
+        return True
+
+
+    def _tt_cache_covers(self, requested, min_coords, max_coords,
+                         strict=False):
+        """
+        True when the cached traveltimes already satisfy this request.
+
+        Needs both: every requested arrival was covered by the cached read,
+        and the requested box lies inside the cached box. A cached bound of
+        None means the whole grid was read on that side, which covers any
+        request; a requested bound of None asks for the whole grid, which
+        only a cached None can cover.
+        """
+        if not self.cy_traveltimes or self.cy_tt_box_keys is None:
+            return False
+        # Arrivals may have been dropped (outlier rejection) and re-added
+        # (residual reporting); a subset is still covered by the wider read.
+        if not requested <= self.cy_tt_box_keys:
+            return False
+
+        for cached, req, lower in (
+            (self.cy_tt_box_min, min_coords, True),
+            (self.cy_tt_box_max, max_coords, False),
+        ):
+            if cached is None:
+                continue                      # whole grid, covers anything
+            if req is None:
+                return False                  # asks for more than we hold
+            req = np.asarray(req, dtype=np.float64)
+            if strict:
+                if not np.array_equal(req, cached):
+                    return False
+            elif lower:
+                if np.any(req < cached):
+                    return False
+            else:
+                if np.any(req > cached):
+                    return False
+        return True
+
+
+    def invalidate_traveltimes(self):
+        """
+        Force the next read_traveltimes() to hit the inventory. Call after
+        new grids are written to the inventory during the life of this
+        locator; presence is cached, so a grid that was missing at the last
+        read stays missing until this is called.
+        """
+        self.cy_tt_box_min = None
+        self.cy_tt_box_max = None
+        self.cy_tt_box_keys = None
         return True
 
 

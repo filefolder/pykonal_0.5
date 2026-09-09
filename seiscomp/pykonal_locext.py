@@ -22,6 +22,8 @@ LocExt may additionally pass:
 All diagnostics go to stderr (visible in scolv's process manager / logs);
 stdout carries ONLY the result XML.
 """
+import time as _time
+#_T_PROC = _time.time()
 
 import argparse
 import contextlib
@@ -36,7 +38,7 @@ import traceback
 
 import numpy as np
 
-_REAL_STDOUT = sys.stdout  # replaced with the true fd-1 stream inside main()
+_REAL_STDOUT = sys.stdout
 
 import seiscomp.core
 import seiscomp.datamodel
@@ -47,8 +49,7 @@ from pykonal.transformations import geo2sph, sph2geo
 from pykonal import constants as pk_constants
 
 # Mean Earth radius (km) for angular <-> arc-length conversions on the
-# spherical grid. Grids are always spherical (pykonal geo2sph); the former
-# cartesian / local-projection path has been removed.
+# spherical grid. Grids are always spherical (pykonal geo2sph)
 MEAN_RADIUS = 6371.0088
 
 
@@ -76,7 +77,7 @@ def chi_scale(percent, dof):
     1-sigma semi-axis as a "68% ellipsoid" understates it by ~47%.
 
     Exact for dof 1 and 2; Wilson-Hilferty for dof 3 (error < 0.5% over the
-    range of levels anyone reports). No scipy dependency.
+    range of levels anyone reports).
     """
     p = min(max(percent / 100.0, 1e-6), 1.0 - 1e-9)
     nd = NormalDist()
@@ -320,11 +321,26 @@ def _model_fingerprint(vm_path):
 def _shard_is_current(dirpath, key, velocity_models):
     """True if the stored grid exists AND was built from the current model."""
     path = _shard_path(dirpath, key)
-    if not os.path.exists(path):
+    try:
+        shard_st = os.stat(path)
+    except OSError:
         return False
     vm = velocity_models.get(key[2]) or velocity_models.get(key[2].upper())
     if not isinstance(vm, str):
         return True          # cannot fingerprint an in-memory model
+ 
+    # Fast path: a shard written after the model file was last touched can
+    # only have been built from the current model, so the stored
+    # fingerprint must match and there is no need to open the grid.
+    #
+    # Same failure mode as the fingerprint it short-circuits: a model file
+    # restored with an older mtime looks unchanged to both.
+    try:
+        if shard_st.st_mtime >= os.stat(vm).st_mtime:
+            return True
+    except OSError:
+        pass                 # model file unreadable; fall through and check
+ 
     want = _model_fingerprint(vm)
     try:
         import h5py
@@ -335,6 +351,7 @@ def _shard_is_current(dirpath, key, velocity_models):
         return got == want
     except Exception:
         return False
+
 
 
 def _build_one_shard(args):
@@ -460,6 +477,13 @@ def ensure_traveltimes_sharded(dirpath, requests, velocity_models,
 
     if todo:
         n = nproc or min(len(todo), os.cpu_count() or 1)
+        n = max(1, int(n))
+        # Announced here rather than by the caller: the caller would have
+        # to repeat the staleness scan to know what is missing, and that
+        # scan may open every shard file. One scan, one announcement.
+        log(f"computing {len(todo)} new traveltime grid(s) before locating "
+            f"on {n} CPU(s) (one FMM solve each; this can take a while) — "
+            f"{', '.join('.'.join(t[0]) for t in todo)}")
         if n > 1:
             import multiprocessing
             with multiprocessing.Pool(processes=n) as pool:
@@ -1003,7 +1027,6 @@ def main():
 
     velocity_models = cfg.get("velocity_models", {})
     if velocity_models:
-        import time as _time
         from pykonal.inventory import (
             ensure_traveltimes, TraveltimeInventory
         )
@@ -1068,13 +1091,6 @@ def main():
         to_build = []
         inv_path = inventory_path
         if sharded:
-            # per-station files: presence is a cheap filesystem check, no
-            # lock and no need to open the inventory at all
-            to_build = [
-                k for k, c in requests.items()
-                if c is not None
-                and not _shard_is_current(shard_dir, k, velocity_models)
-            ]
             if not os.path.isdir(shard_dir):
                 log(f"traveltime directory {shard_dir} does not exist yet; "
                     f"creating it")
@@ -1093,7 +1109,6 @@ def main():
             log(f"traveltime inventory {inv_path} does not exist yet; "
                 f"building it now")
 
-        _t_build = None
         if to_build:
             # Effective worker count, mirroring ensure_traveltimes():
             # explicit ensure_nproc if set, else min(n_missing, cpu_count).
@@ -1106,7 +1121,8 @@ def main():
                 f"locating on {_nproc} CPU(s) "
                 f"(one FMM solve each; this can take a while) — "
                 f"{', '.join('.'.join(k) for k in to_build)}")
-            _t_build = _time.time()
+
+        _t_build = _time.time()
 
         if sharded:
             report = ensure_traveltimes_sharded(

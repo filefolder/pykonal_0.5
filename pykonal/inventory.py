@@ -589,4 +589,3 @@ def ensure_traveltimes(path, requests, velocity_models, max_dist=None,
         os.close(fd)
 
     return result
-
